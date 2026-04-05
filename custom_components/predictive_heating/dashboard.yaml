@@ -1,0 +1,251 @@
+###############################################################################
+# Predictive Heating Dashboard
+#
+# Install: Settings → Dashboards → Add → Edit → Raw config editor → paste
+#
+# Replace placeholder entity IDs (sensor.living_room_temperature etc.)
+# Device sensor names depend on your device names from setup.
+# E.g. device named "Gas Boiler" → sensor.predictive_heating_gas_boiler_*
+###############################################################################
+
+title: Predictive Heating
+views:
+  - title: Overview
+    path: overview
+    icon: mdi:home-thermometer
+    type: sections
+    sections:
+      - title: Current Status
+        type: grid
+        cards:
+          - type: entity
+            entity: sensor.predictive_heating_current_target_temperature
+            name: Target
+
+          # ← Replace with your actual indoor temp sensor
+          - type: entity
+            entity: sensor.living_room_temperature
+            name: Indoor
+
+          # ← Replace with your actual outdoor temp sensor
+          - type: entity
+            entity: sensor.outdoor_temperature
+            name: Outdoor
+
+          - type: entity
+            entity: sensor.predictive_heating_predicted_temperature
+            name: Predicted
+
+      - title: Model Health
+        type: grid
+        cards:
+          - type: gauge
+            entity: sensor.predictive_heating_model_fit_r2
+            name: Model Fit R²
+            min: 0
+            max: 1
+            needle: true
+            severity:
+              green: 0.8
+              yellow: 0.5
+              red: 0
+
+          - type: entity
+            entity: sensor.predictive_heating_heat_loss_coefficient_ua
+            name: UA (W/K)
+
+          - type: entity
+            entity: sensor.predictive_heating_thermal_mass
+            name: C (kWh/K)
+
+          - type: entity
+            entity: sensor.predictive_heating_next_model_training
+            name: Next Training
+
+      - title: Cost
+        type: grid
+        cards:
+          - type: entity
+            entity: sensor.predictive_heating_estimated_heating_cost_24h
+            name: Estimated 24h Cost
+
+          # ← Replace with your Nordpool entity
+          - type: entity
+            entity: sensor.nordpool_kwh_nl_eur
+            name: Electricity Price
+
+      # ── Duplicate per device ──
+      - title: "Gas Boiler"
+        type: grid
+        cards:
+          - type: entity
+            entity: sensor.predictive_heating_gas_boiler_recommended_state
+            name: Recommended
+            state_color: true
+          - type: gauge
+            entity: sensor.predictive_heating_gas_boiler_recommended_output
+            name: Output
+            min: 0
+            max: 100
+            unit: "%"
+          - type: entity
+            entity: sensor.predictive_heating_gas_boiler_heat_output
+            name: Heat (W)
+
+      - title: "Heat Pump"
+        type: grid
+        cards:
+          - type: entity
+            entity: sensor.predictive_heating_heat_pump_recommended_state
+            name: Recommended
+            state_color: true
+          - type: gauge
+            entity: sensor.predictive_heating_heat_pump_recommended_output
+            name: Output
+            min: 0
+            max: 100
+            unit: "%"
+          - type: entity
+            entity: sensor.predictive_heating_heat_pump_heat_output
+            name: Heat (W)
+
+  - title: Graphs
+    path: graphs
+    icon: mdi:chart-line
+    type: sections
+    sections:
+      - title: Temperature (24h)
+        type: grid
+        cards:
+          - type: history-graph
+            hours_to_show: 24
+            entities:
+              - entity: sensor.living_room_temperature
+                name: Indoor Actual
+              - entity: sensor.predictive_heating_predicted_temperature
+                name: Predicted
+              - entity: sensor.predictive_heating_current_target_temperature
+                name: Target
+              - entity: sensor.outdoor_temperature
+                name: Outdoor
+
+      - title: Temperature (7 days)
+        type: grid
+        cards:
+          - type: history-graph
+            hours_to_show: 168
+            entities:
+              - entity: sensor.living_room_temperature
+                name: Indoor
+              - entity: sensor.predictive_heating_predicted_temperature
+                name: Predicted
+              - entity: sensor.outdoor_temperature
+                name: Outdoor
+
+      - title: Device Activity (24h)
+        type: grid
+        cards:
+          - type: history-graph
+            hours_to_show: 24
+            entities:
+              - entity: sensor.predictive_heating_gas_boiler_recommended_state
+                name: Boiler
+              - entity: sensor.predictive_heating_heat_pump_recommended_state
+                name: Heat Pump
+          - type: history-graph
+            hours_to_show: 24
+            entities:
+              - entity: sensor.predictive_heating_gas_boiler_heat_output
+                name: Boiler (W)
+              - entity: sensor.predictive_heating_heat_pump_heat_output
+                name: Heat Pump (W)
+
+      - title: Model Parameters (30 days)
+        type: grid
+        cards:
+          - type: history-graph
+            hours_to_show: 720
+            entities:
+              - entity: sensor.predictive_heating_heat_loss_coefficient_ua
+                name: UA (W/K)
+              - entity: sensor.predictive_heating_model_fit_r2
+                name: R²
+
+      - title: Cost
+        type: grid
+        cards:
+          - type: history-graph
+            hours_to_show: 168
+            entities:
+              - entity: sensor.predictive_heating_estimated_heating_cost_24h
+                name: 24h Cost (€)
+
+  - title: Debug
+    path: debug
+    icon: mdi:bug-outline
+    type: sections
+    sections:
+      - title: Decision Trace
+        type: grid
+        cards:
+          - type: entity
+            entity: sensor.predictive_heating_decision_trace
+            name: Last Optimization
+
+          - type: markdown
+            content: >-
+              ## How to read the trace
+
+              Open **Developer Tools → States** and find
+              `sensor.predictive_heating_decision_trace`.
+              The attributes contain:
+
+              - **optimization.last_steps**: the last 10 optimizer decisions
+                with full inputs/outputs and human-readable notes
+
+              - **training**: data collection stats, model fit details,
+                convergence info
+
+              Each device state sensor also has a **reason** attribute
+              explaining why it's on or off.
+
+              ### Enable full debug logging
+
+              Add to `configuration.yaml`:
+
+              ```yaml
+              logger:
+                logs:
+                  custom_components.predictive_heating: debug
+              ```
+
+              This logs every single trace step to the HA log.
+
+      - title: Manual Controls
+        type: grid
+        cards:
+          - type: button
+            name: Train Model Now
+            icon: mdi:brain
+            tap_action:
+              action: perform-action
+              perform_action: predictive_heating.train_model
+          - type: button
+            name: Get Forecast
+            icon: mdi:chart-timeline-variant
+            tap_action:
+              action: perform-action
+              perform_action: predictive_heating.get_forecast
+
+      - title: Diagnostics
+        type: grid
+        cards:
+          - type: markdown
+            content: >-
+              ## Full diagnostics dump
+
+              Go to **Settings → Devices → Predictive Heating →
+              three dots → Download diagnostics**.
+
+              This exports config, model parameters, traces, and
+              data quality — everything needed to debug issues.
