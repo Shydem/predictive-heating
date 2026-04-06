@@ -116,6 +116,12 @@ PREHEAT_PRICE_RATIO: Final = 1.20
 PREHEAT_MAX_OVERSHOOT_K: Final = 0.5
 """Max °C above target when preheating."""
 
+DEFAULT_AWAY_TEMP: Final = 15.0
+"""Setpoint when device should not heat (prevents frost, doesn't waste energy)."""
+
+CONF_AWAY_TEMP: Final = "away_temp"
+CONF_AUTO_CONTROL: Final = "auto_control"
+
 COMFORT_PENALTY_WEIGHT: Final = 50.0
 """€/K²/h penalty for being below target. Higher = prioritize comfort."""
 

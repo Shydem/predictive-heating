@@ -108,6 +108,8 @@ class DeviceDecision:
     cost_per_wh: float
     energy_source: str
     reason: str  # human-readable explanation
+    recommended_setpoint: float = 15.0
+    """Temperature setpoint to send to this device's thermostat."""
 
 
 @dataclass

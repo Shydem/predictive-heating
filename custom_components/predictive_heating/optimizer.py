@@ -11,6 +11,7 @@ from typing import Any
 
 from .const import (
     COMFORT_PENALTY_WEIGHT,
+    DEFAULT_AWAY_TEMP,
     J_PER_KWH,
     ON_OFF_MIN_DUTY_CYCLE,
     PREHEAT_MAX_OVERSHOOT_K,
@@ -43,6 +44,7 @@ def optimize_heating(
     cop_a: float,
     cop_b: float,
     gas_efficiency: float,
+    away_temp: float = DEFAULT_AWAY_TEMP,
 ) -> OptimizationResult:
     """Find the cheapest heating plan that meets comfort targets.
 
@@ -86,6 +88,7 @@ def optimize_heating(
             cop_a=cop_a,
             cop_b=cop_b,
             gas_efficiency=gas_efficiency,
+            away_temp=away_temp,
             trace=trace,
         )
 
@@ -114,6 +117,7 @@ def _optimize_one_slot(
     cop_a: float,
     cop_b: float,
     gas_efficiency: float,
+    away_temp: float,
     trace: Trace,
 ) -> SlotResult:
     """Optimize heating for a single time slot.
@@ -171,6 +175,16 @@ def _optimize_one_slot(
         ranked, total_need_wh, dt, trace, slot_index,
     )
 
+    # Step 5b: Compute recommended thermostat setpoint per device
+    for d in decisions:
+        if d.output_pct > 0:
+            if is_preheating:
+                d.recommended_setpoint = round(slot.t_target + PREHEAT_MAX_OVERSHOOT_K, 1)
+            else:
+                d.recommended_setpoint = round(slot.t_target, 1)
+        else:
+            d.recommended_setpoint = round(away_temp, 1)
+
     # Step 6: Compute actual temperature with allocated heating
     total_heating_w = sum(d.heat_output_w for d in decisions)
     t_after, _, _ = euler_step(
@@ -205,7 +219,7 @@ def _optimize_one_slot(
             "energy_cost": round(energy_cost, 4),
             "comfort_cost": round(comfort_cost, 4),
             "is_preheating": is_preheating,
-            "devices": {d.device_name: f"{d.output_pct:.0f}% ({d.reason})" for d in decisions},
+            "devices": {d.device_name: f"{d.recommended_setpoint}°C ({d.reason})" for d in decisions},
         }, note=(
             f"{'PREHEAT: ' + preheat_reason + ' | ' if is_preheating else ''}"
             f"T {t_current:.1f}→{t_after:.1f}°C (target {slot.t_target:.1f}), "

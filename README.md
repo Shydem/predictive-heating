@@ -4,128 +4,149 @@ A Home Assistant custom integration that models your house as a **first-order lu
 
 ## Features
 
-- **Self-training thermal model**: Automatically fits UA (heat loss coefficient) and C (thermal capacitance) parameters weekly from the past month of data
-- **Multi-source heating**: Supports gas boilers and heat pumps simultaneously, with on/off and stepless (modulating) control
-- **Per-device COP curves**: Enter your heat pump's manufacturer COP data points — the integration interpolates for any outdoor temperature
-- **Multiple heat pumps**: Add as many devices as you need, each with their own performance curve
-- **Gas-free support**: Works with heat-pump-only homes — gas sensors and parameters are fully optional
-- **Price optimization**: Minimizes total heating cost using future electricity prices from Nordpool (custom HACS or official), ENTSO-e, or any sensor with price attributes
-- **Solar gain estimation**: Accounts for passive solar heating through windows using weather forecast data
-- **Flexible inputs**: All sensors except indoor/outdoor temperature and electricity price are optional
+- **Thermostat setpoint output** — tells each device what temperature to set, not on/off. Works with any climate entity (Daikin, Climatherm, OpenTherm CV, etc.)
+- **Auto-control mode** — optionally pushes the computed setpoint to your thermostat every 5 minutes
+- **Self-training thermal model** — fits UA and C parameters weekly from historical data
+- **Per-device COP curves** — enter your heat pump's spec sheet data points, the model interpolates for any outdoor temperature
+- **Multiple heat pumps** — each with their own COP curve; optimizer picks the cheapest one first
+- **Gas-free support** — all gas-related fields are optional
+- **Minimal sensor requirements** — only indoor temp, outdoor temp, and electricity price are required
+- **Price optimization** — auto-detects Nordpool (HACS or official), ENTSO-e, or any price sensor
+- **Solar gain estimation** — uses weather forecast cloud coverage
 
 ## How It Works
 
 The integration models your home as a single thermal node:
 
 ```
-C * dT/dt = Q_heating + Q_solar + Q_internal - UA * (T_indoor - T_outdoor)
+C × dT/dt = Q_heating + Q_solar + Q_internal − UA × (T_indoor − T_outdoor)
 ```
 
-Where:
-- **C** = thermal capacitance of the building (J/K)
-- **UA** = overall heat loss coefficient (W/K)
-- **Q_heating** = heat input from all heating devices
-- **Q_solar** = passive solar gain (estimated from weather forecast cloud coverage)
-- **Q_internal** = internal gains (appliances, cooking, people)
-- **T_indoor**, **T_outdoor** = indoor and outdoor temperatures
+Every week, UA and C are re-fitted from sensor data. The optimizer then computes the cheapest heating plan over the next 24h and outputs a **thermostat setpoint** for each device:
 
-Every week, the model re-fits UA and C from recorded data using least-squares optimization. It then uses these parameters along with future energy prices and your desired temperature schedule to compute the cheapest heating plan.
+| Situation | Setpoint |
+|---|---|
+| Heating needed | Your schedule target (e.g. 20°C) |
+| Preheating (next hour is expensive) | Target + 0.5°C |
+| No heating needed | Away temperature (default 15°C) |
+| Secondary device (primary is cheaper) | Away temperature |
 
 ## Installation
 
 ### HACS (Recommended)
 
-1. Open HACS in Home Assistant
-2. Click the three dots → Custom repositories
-3. Add this repository URL, category: Integration
-4. Search for "Predictive Heating" and install
-5. Restart Home Assistant
-6. Go to Settings → Devices & Services → Add Integration → Predictive Heating
+1. HACS → Custom repositories → Add this URL (category: Integration)
+2. Search "Predictive Heating" → Install → Restart HA
+3. Settings → Devices & Services → Add Integration → Predictive Heating
 
 ### Manual
 
-Copy `custom_components/predictive_heating/` to your Home Assistant `config/custom_components/` directory.
+Copy `custom_components/predictive_heating/` to your HA `config/custom_components/` directory.
 
 ## Configuration
 
-The integration is configured through the UI config flow. You will need to provide:
+### Step 1: Sensor Entities
 
-### Sensor Entities
-
-| Parameter | Required | Description |
+| Entity | Required | Notes |
 |---|---|---|
-| Indoor temperature sensor | **Yes** | e.g. `sensor.living_room_temperature` |
-| Outdoor temperature sensor | **Yes** | e.g. `sensor.outdoor_temperature` |
-| Electricity price sensor | **Yes** | Nordpool, ENTSO-e, or any sensor with price data |
-| Gas consumption sensor | No | Total gas meter (m³ or kWh) — only if you have gas heating |
-| Total electricity sensor | No | Total electricity consumption (kWh) — used to estimate internal heat gains |
-| Heat pump power sensor | No | Heat pump electrical consumption (kWh) |
-| Weather entity | No | HA weather entity for temperature/cloud forecast |
+| Indoor temperature | **Yes** | `sensor.living_room_temperature` |
+| Outdoor temperature | **Yes** | `sensor.outdoor_temperature` |
+| Electricity price | **Yes** | Nordpool, ENTSO-e, or any price sensor |
+| Gas consumption | No | Only if you have gas heating |
+| Total electricity | No | Used to estimate internal heat gains |
+| Heat pump electricity | No | Cumulative kWh from Daikin, Climatherm, etc. |
+| Weather entity | No | For temperature/cloud forecast |
+
+### Step 2: House Profile
+
+Describe your house (type, floor area, insulation, thermal mass) for cold-start estimates. Refined automatically after 1-2 weeks.
+
+### Step 3: Model Parameters
+
+Only relevant fields are shown based on your setup.
+
+| Parameter | Default | Notes |
+|---|---|---|
+| Away temperature | 15°C | Setpoint when device shouldn't heat |
+| Auto-control | Off | Push setpoints to thermostats automatically |
+| Gas heating fraction | 0.85 | Only shown if gas sensor configured |
+| Gas efficiency | 0.90 | Only shown if gas sensor configured |
+| Gas price | €1.00/m³ | Only shown if gas sensor configured |
+| Background heat gain | 200W | Only shown if no total electricity sensor |
+| Training interval | 7 days | |
+| Prediction horizon | 24 hours | |
+
+### Step 4: Heating Devices
+
+Add each heating device with:
+- **Name** (e.g. "Daikin", "Climatherm", "CV Ketel")
+- **Entity** (the climate entity of this device)
+- **Type**: On/Off or Stepless (modulating)
+- **Source**: Gas or Electric
+- **Max output** (W)
+- **COP data** (electric only): pairs from the spec sheet, e.g. `-7:2.5, 2:3.2, 7:4.0, 12:4.8`
+
+If no COP data is entered, a typical air-source curve is used.
 
 ### Supported Price Integrations
 
-The integration auto-detects the format from your electricity price sensor:
+Auto-detected from sensor attributes:
 
-| Integration | Detected via | Format |
-|---|---|---|
-| Custom Nordpool (HACS) | `raw_today` / `raw_tomorrow` attributes | `{start, end, value}` dicts |
-| ENTSO-e (HACS) | `prices` attribute | `{time, price}` dicts |
-| Official Nordpool (HA Core) | `today` / `tomorrow` plain lists | Price per hour |
-| Any price sensor | Sensor state | Flat rate fallback |
-
-### Heating Devices
-
-Add one or more heating devices with:
-- Entity ID of the climate/switch entity
-- Type: `on_off` or `stepless` (modulating)
-- Source: `gas` or `electric`
-- Maximum heat output (W)
-- **COP data points** (electric devices only): Enter manufacturer data as `outdoor_temp:COP` pairs, e.g. `-7:2.5, 2:3.2, 7:4.0, 12:4.8`
-
-If no COP data is provided for an electric device, a typical air-source curve is used as default.
-
-### Model Parameters
-
-Parameters shown depend on your setup — gas-specific fields only appear if you configured a gas sensor.
-
-| Parameter | Default | Description |
-|---|---|---|
-| Heating/hot water fraction | 0.85 | Fraction of gas used for space heating vs. hot water |
-| Gas heating efficiency | 0.90 | Boiler efficiency |
-| Outdoor electric loads (W) | 0 | EV chargers, outdoor lighting, etc. to subtract |
-| Background heat gain (W) | 200 | Heat from appliances/people (shown if no electricity sensor) |
-| Gas price (€/m³) | 1.0 | Current gas price |
-| Training interval (days) | 7 | How often to retrain the model |
-| Training window (days) | 30 | How much history to use for training |
-| Prediction horizon (hours) | 24 | How far ahead to optimize |
-| Optimization timestep (min) | 15 | Resolution of the optimization |
+| Integration | Format |
+|---|---|
+| Custom Nordpool (HACS) | `raw_today`/`raw_tomorrow` → `{start, value}` |
+| ENTSO-e (HACS) | `prices` → `{time, price}` |
+| Official Nordpool | `today`/`tomorrow` plain lists |
+| Any sensor | Falls back to current state as flat rate |
 
 ## Sensors Created
 
-| Sensor | Description |
-|---|---|
-| `sensor.predictive_heating_ua_value` | Fitted UA heat loss coefficient (W/K) |
-| `sensor.predictive_heating_thermal_mass` | Fitted thermal capacitance (kWh/K) |
-| `sensor.predictive_heating_predicted_temperature` | Model-predicted indoor temperature |
-| `sensor.predictive_heating_estimated_cost_24h` | Estimated heating cost for next 24h |
-| `sensor.predictive_heating_model_fit_r2` | R² goodness of fit from last training |
-| `sensor.predictive_heating_next_training` | Timestamp of next scheduled training |
+### Model sensors
 
-### Per heating device:
 | Sensor | Description |
 |---|---|
-| `sensor.predictive_heating_{name}_recommended_state` | on/off recommendation |
-| `sensor.predictive_heating_{name}_recommended_output` | 0-100% for stepless devices |
-| `sensor.predictive_heating_{name}_heat_output_w` | Current estimated heat output |
+| `..._ua_value` | Heat loss coefficient (W/K) |
+| `..._thermal_mass` | Thermal capacitance (kWh/K) |
+| `..._predicted_temperature` | Model-predicted indoor temp |
+| `..._estimated_cost_24h` | Estimated heating cost for next 24h |
+| `..._model_fit_r2` | Goodness of fit (1.0 = perfect) |
+| `..._current_target_temperature` | Active schedule target |
+
+### Per device
+
+| Sensor | Description |
+|---|---|
+| `..._recommended_setpoint` | **The main output.** Set your thermostat to this. |
+| `..._recommended_state` | on/off (for automations) |
+| `..._recommended_output` | 0-100% for modulating devices |
+| `..._heat_output` | Estimated heat output in W |
+
+### Using setpoints without auto-control
+
+If you prefer manual automations:
+
+```yaml
+automation:
+  - alias: "Apply Daikin setpoint"
+    trigger:
+      - platform: state
+        entity_id: sensor.predictive_heating_daikin_recommended_setpoint
+    action:
+      - service: climate.set_temperature
+        target:
+          entity_id: climate.daikin
+        data:
+          temperature: "{{ states('sensor.predictive_heating_daikin_recommended_setpoint') | float }}"
+```
 
 ## Services
 
 | Service | Description |
 |---|---|
-| `predictive_heating.train_model` | Trigger immediate model re-training |
-| `predictive_heating.set_schedule` | Update the desired temperature schedule |
-| `predictive_heating.get_forecast` | Return the optimized heating plan as a forecast |
-| `predictive_heating.set_model_params` | Manually override UA and/or thermal mass |
+| `predictive_heating.train_model` | Trigger immediate re-training |
+| `predictive_heating.set_schedule` | Update temperature schedule |
+| `predictive_heating.get_forecast` | Get the optimized heating plan |
+| `predictive_heating.set_model_params` | Override UA / thermal mass |
 
 ## License
 

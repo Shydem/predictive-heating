@@ -116,6 +116,7 @@ async def async_setup_entry(
 
     # Per-device sensors
     for device in coordinator.devices:
+        entities.append(DeviceSetpointSensor(coordinator, device.name, entry))
         entities.append(DeviceStateSensor(coordinator, device.name, entry))
         entities.append(DeviceOutputSensor(coordinator, device.name, entry))
         entities.append(DeviceHeatSensor(coordinator, device.name, entry))
@@ -308,3 +309,52 @@ class DeviceHeatSensor(CoordinatorEntity[PredictiveHeatingCoordinator], SensorEn
             return None
         dev = self.coordinator.data.get("devices", {}).get(self._device_name, {})
         return dev.get("heat_output_w")
+
+
+class DeviceSetpointSensor(CoordinatorEntity[PredictiveHeatingCoordinator], SensorEntity):
+    """Recommended thermostat setpoint for this device.
+
+    This is the primary output of the integration — set your thermostat
+    to this value and the optimizer handles the rest. Use it in an
+    automation or enable auto-control to have it applied automatically.
+    """
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self, coordinator: PredictiveHeatingCoordinator,
+        device_name: str, entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator)
+        self._device_name = device_name
+        self._attr_unique_id = f"{entry.entry_id}_{device_name}_setpoint"
+        self._attr_name = f"{device_name} Recommended Setpoint"
+        self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+        self._attr_device_class = SensorDeviceClass.TEMPERATURE
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_icon = "mdi:thermostat"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> float | None:
+        if self.coordinator.data is None:
+            return None
+        dev = self.coordinator.data.get("devices", {}).get(self._device_name, {})
+        return dev.get("recommended_setpoint")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Show WHY this setpoint was chosen."""
+        if self.coordinator.data is None:
+            return None
+        dev = self.coordinator.data.get("devices", {}).get(self._device_name, {})
+        if not dev:
+            return None
+        data = self.coordinator.data
+        return {
+            "reason": dev.get("reason", "unknown"),
+            "current_target": data.get("current_target"),
+            "current_indoor": data.get("t_indoor"),
+            "current_outdoor": data.get("t_outdoor"),
+            "cost_per_wh": dev.get("cost_per_wh"),
+        }

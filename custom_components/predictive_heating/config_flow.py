@@ -13,6 +13,8 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_AUTO_CONTROL,
+    CONF_AWAY_TEMP,
     CONF_COP_COEFFICIENTS,
     CONF_DEVICE_COP_DATA,
     CONF_DEVICE_ENTITY,
@@ -42,6 +44,7 @@ from .const import (
     CONF_TRAINING_INTERVAL_DAYS,
     CONF_TRAINING_WINDOW_DAYS,
     CONF_WEATHER_ENTITY,
+    DEFAULT_AWAY_TEMP,
     DEFAULT_COP_A,
     DEFAULT_COP_B,
     DEFAULT_GAS_EFFICIENCY,
@@ -212,6 +215,13 @@ class PredictiveHeatingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     min=0, max=2000, step=50, unit_of_measurement="W",
                 ))
 
+        schema_fields[vol.Optional(CONF_AWAY_TEMP, default=DEFAULT_AWAY_TEMP)] = \
+            selector.NumberSelector(selector.NumberSelectorConfig(
+                min=5, max=20, step=0.5, unit_of_measurement="°C",
+            ))
+        schema_fields[vol.Optional(CONF_AUTO_CONTROL, default=False)] = \
+            selector.BooleanSelector()
+
         schema_fields[vol.Optional(CONF_TRAINING_INTERVAL_DAYS, default=DEFAULT_TRAINING_INTERVAL_DAYS)] = \
             selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=30, step=1))
         schema_fields[vol.Optional(CONF_TRAINING_WINDOW_DAYS, default=DEFAULT_TRAINING_WINDOW_DAYS)] = \
@@ -318,6 +328,14 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
         schema_fields[vol.Optional(CONF_OUTDOOR_ELECTRIC_LOADS_W,
             default=current.get(CONF_OUTDOOR_ELECTRIC_LOADS_W, DEFAULT_OUTDOOR_ELECTRIC_LOADS_W))] = \
             selector.NumberSelector(selector.NumberSelectorConfig(min=0, max=50000, step=100, unit_of_measurement="W"))
+        schema_fields[vol.Optional(CONF_AWAY_TEMP,
+            default=current.get(CONF_AWAY_TEMP, DEFAULT_AWAY_TEMP))] = \
+            selector.NumberSelector(selector.NumberSelectorConfig(
+                min=5, max=20, step=0.5, unit_of_measurement="°C",
+            ))
+        schema_fields[vol.Optional(CONF_AUTO_CONTROL,
+            default=current.get(CONF_AUTO_CONTROL, False))] = \
+            selector.BooleanSelector()
         schema_fields[vol.Optional(CONF_TRAINING_INTERVAL_DAYS,
             default=current.get(CONF_TRAINING_INTERVAL_DAYS, DEFAULT_TRAINING_INTERVAL_DAYS))] = \
             selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=30, step=1))

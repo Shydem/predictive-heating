@@ -18,6 +18,8 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_AUTO_CONTROL,
+    CONF_AWAY_TEMP,
     CONF_COP_COEFFICIENTS,
     CONF_ELECTRICITY_PRICE_ENTITY,
     CONF_GAS_EFFICIENCY,
@@ -38,6 +40,7 @@ from .const import (
     CONF_DEVICE_NAME,
     CONF_DEVICE_SOURCE,
     CONF_DEVICE_TYPE,
+    DEFAULT_AWAY_TEMP,
     DEFAULT_COP_A,
     DEFAULT_COP_B,
     DEFAULT_COP_DATA_AIR_SOURCE,
@@ -525,11 +528,12 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Run optimizer
         cop_coeffs = self.config.get(CONF_COP_COEFFICIENTS, [DEFAULT_COP_A, DEFAULT_COP_B])
         gas_eff = self.config.get(CONF_GAS_EFFICIENCY, DEFAULT_GAS_EFFICIENCY)
+        away_temp = self.config.get(CONF_AWAY_TEMP, DEFAULT_AWAY_TEMP)
 
         self.last_optimization = await self.hass.async_add_executor_job(
             optimize_heating,
             self.params, self.devices, slots, t_indoor,
-            cop_coeffs[0], cop_coeffs[1], gas_eff,
+            cop_coeffs[0], cop_coeffs[1], gas_eff, away_temp,
         )
 
         if self.last_optimization.trace:
@@ -542,10 +546,16 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 first_slot_decisions[d.device_name] = {
                     "recommended_state": d.output_pct > 0,
                     "recommended_output_pct": d.output_pct,
+                    "recommended_setpoint": d.recommended_setpoint,
                     "heat_output_w": d.heat_output_w,
                     "cost_per_wh": round(d.cost_per_wh, 6),
                     "reason": d.reason,
                 }
+
+        # Auto-control: push setpoint to climate entities if enabled
+        auto_control = self.config.get(CONF_AUTO_CONTROL, False)
+        if auto_control and first_slot_decisions:
+            await self._apply_setpoints(first_slot_decisions)
 
         predicted_temp = (
             self.last_optimization.predicted_temperatures[1]
@@ -575,3 +585,51 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             "solar_gain_current_w": round(slots[0].solar_gain_w, 0) if slots else 0,
         }
+
+    async def _apply_setpoints(
+        self, decisions: dict[str, dict],
+    ) -> None:
+        """Push recommended setpoints to climate entities.
+
+        Only acts on climate.* entities (ignores switch/number).
+        Logs every change so the user can verify behavior.
+        """
+        for device in self.devices:
+            info = decisions.get(device.name)
+            if info is None:
+                continue
+
+            entity_id = device.entity_id
+            if not entity_id.startswith("climate."):
+                continue
+
+            setpoint = info.get("recommended_setpoint")
+            if setpoint is None:
+                continue
+
+            # Read current setpoint to avoid unnecessary service calls
+            state = self.hass.states.get(entity_id)
+            if state is not None:
+                current = state.attributes.get("temperature")
+                if current is not None:
+                    try:
+                        if abs(float(current) - setpoint) < 0.1:
+                            continue  # Already at the right setpoint
+                    except (ValueError, TypeError):
+                        pass
+
+            try:
+                await self.hass.services.async_call(
+                    "climate",
+                    "set_temperature",
+                    {"entity_id": entity_id, "temperature": setpoint},
+                    blocking=False,
+                )
+                _LOGGER.info(
+                    "Auto-control: set %s to %.1f°C (%s)",
+                    entity_id, setpoint, info.get("reason", ""),
+                )
+            except Exception as err:
+                _LOGGER.warning(
+                    "Failed to set temperature on %s: %s", entity_id, err,
+                )
