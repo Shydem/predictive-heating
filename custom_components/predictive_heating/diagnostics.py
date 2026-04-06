@@ -43,15 +43,13 @@ async def async_get_config_entry_diagnostics(
         },
         "current_data": coordinator.data if coordinator.data else "no data yet",
         "schedule": coordinator.schedule,
-        "devices": [
+        "heaters": [
             {
-                "name": d.name,
-                "entity_id": d.entity_id,
-                "type": d.device_type,
-                "source": d.energy_source,
-                "max_output_w": d.max_output_w,
+                "name": h.name,
+                "entity_id": h.entity_id,
+                "power_w": h.power_w,
             }
-            for d in coordinator.devices
+            for h in coordinator.heaters
         ],
         "last_training_trace": coordinator.last_training_trace,
         "last_optimization_trace": coordinator.last_optimize_trace,

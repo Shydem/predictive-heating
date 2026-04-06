@@ -14,16 +14,8 @@ DOMAIN: Final = "predictive_heating"
 
 CONF_INDOOR_TEMP_ENTITY: Final = "indoor_temp_entity"
 CONF_OUTDOOR_TEMP_ENTITY: Final = "outdoor_temp_entity"
-CONF_GAS_CONSUMPTION_ENTITY: Final = "gas_consumption_entity"
-CONF_TOTAL_ELECTRICITY_ENTITY: Final = "total_electricity_entity"
-CONF_HEATPUMP_ELECTRICITY_ENTITY: Final = "heatpump_electricity_entity"
 CONF_ELECTRICITY_PRICE_ENTITY: Final = "electricity_price_entity"
 CONF_WEATHER_ENTITY: Final = "weather_entity"
-CONF_GAS_PRICE: Final = "gas_price"
-CONF_HEATING_HOT_WATER_FRACTION: Final = "heating_hot_water_fraction"
-CONF_GAS_EFFICIENCY: Final = "gas_efficiency"
-CONF_COP_COEFFICIENTS: Final = "cop_coefficients"
-CONF_OUTDOOR_ELECTRIC_LOADS_W: Final = "outdoor_electric_loads_w"
 CONF_INTERNAL_GAIN_W: Final = "internal_gain_w"
 CONF_TRAINING_INTERVAL_DAYS: Final = "training_interval_days"
 CONF_TRAINING_WINDOW_DAYS: Final = "training_window_days"
@@ -43,55 +35,24 @@ HOUSE_TYPE_SEMI_DETACHED: Final = "semi_detached"
 HOUSE_TYPE_TERRACED: Final = "terraced"
 HOUSE_TYPE_APARTMENT: Final = "apartment"
 
-INSULATION_POOR: Final = "poor"       # Pre-1975, label E-G
-INSULATION_MODERATE: Final = "moderate"  # 1975-2000, label C-D
-INSULATION_GOOD: Final = "good"       # Post-2000, label A-B
+INSULATION_POOR: Final = "poor"        # Pre-1975, label E-G
+INSULATION_MODERATE: Final = "moderate"   # 1975-2000, label C-D
+INSULATION_GOOD: Final = "good"        # Post-2000, label A-B
 INSULATION_EXCELLENT: Final = "excellent"  # Passive-house level
 
 THERMAL_MASS_LIGHT: Final = "light"     # Timber frame, prefab
 THERMAL_MASS_MEDIUM: Final = "medium"    # Brick cavity walls
 THERMAL_MASS_HEAVY: Final = "heavy"     # Solid brick, concrete floors
 
+# Simple heater device config keys
 CONF_DEVICE_NAME: Final = "name"
 CONF_DEVICE_ENTITY: Final = "entity_id"
-CONF_DEVICE_TYPE: Final = "device_type"
-CONF_DEVICE_SOURCE: Final = "energy_source"
-CONF_DEVICE_MAX_OUTPUT_W: Final = "max_output_w"
-CONF_DEVICE_COP_DATA: Final = "cop_data_points"
-
-DEVICE_TYPE_ON_OFF: Final = "on_off"
-DEVICE_TYPE_STEPLESS: Final = "stepless"
-SOURCE_GAS: Final = "gas"
-SOURCE_ELECTRIC: Final = "electric"
+CONF_DEVICE_POWER_W: Final = "power_w"
+"""Rated heat output in watts when the heater is on.
+Start with the nameplate value; the model will account for cycling patterns."""
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
-DEFAULT_HEATING_HOT_WATER_FRACTION: Final = 0.85
-"""85% of gas goes to space heating, 15% to hot water."""
-
-DEFAULT_GAS_EFFICIENCY: Final = 0.90
-"""Modern condensing boiler: 90-97%. Older boiler: 80-90%."""
-
-DEFAULT_COP_A: Final = 2.8
-DEFAULT_COP_B: Final = 0.05
-"""Legacy linear COP model. Kept for backward compatibility."""
-
-# Manufacturer-style COP data points: list of (outdoor_temp_°C, COP) tuples.
-# Users enter these from their heat pump's spec sheet.
-# Linear interpolation between points; clamped at extremes.
-
-DEFAULT_COP_DATA_AIR_SOURCE: Final = [
-    (-15, 2.0), (-7, 2.5), (2, 3.2), (7, 4.0), (12, 4.8),
-]
-"""Typical air-source heat pump (Daikin Altherma, Vaillant aroTHERM, etc.)."""
-
-DEFAULT_COP_DATA_GROUND_SOURCE: Final = [
-    (-5, 3.5), (0, 4.0), (5, 4.5), (10, 5.0),
-]
-"""Typical ground-source heat pump (brine-to-water). More stable COP."""
-
-DEFAULT_OUTDOOR_ELECTRIC_LOADS_W: Final = 0.0
-DEFAULT_GAS_PRICE: Final = 1.0
 DEFAULT_TRAINING_INTERVAL_DAYS: Final = 7
 DEFAULT_TRAINING_WINDOW_DAYS: Final = 30
 DEFAULT_PREDICTION_HORIZON_HOURS: Final = 24
@@ -108,7 +69,7 @@ DEFAULT_TEMPERATURE_SCHEDULE: Final = {
 # ─── Optimizer tuning (all in one place) ──────────────────────────────────────
 
 ON_OFF_MIN_DUTY_CYCLE: Final = 0.30
-"""On/off devices only turn on if need > 30% of capacity. Prevents short-cycling."""
+"""On/off heaters only turn on if heat need > 30% of capacity. Prevents short-cycling."""
 
 PREHEAT_PRICE_RATIO: Final = 1.20
 """Preheat if next slot price > 120% of current. Set to 999 to disable."""
@@ -117,20 +78,18 @@ PREHEAT_MAX_OVERSHOOT_K: Final = 0.5
 """Max °C above target when preheating."""
 
 DEFAULT_AWAY_TEMP: Final = 15.0
-"""Setpoint when device should not heat (prevents frost, doesn't waste energy)."""
+"""Setpoint when heater should not heat (frost prevention)."""
 
 CONF_AWAY_TEMP: Final = "away_temp"
 CONF_AUTO_CONTROL: Final = "auto_control"
 
 COMFORT_PENALTY_WEIGHT: Final = 50.0
-"""€/K²/h penalty for being below target. Higher = prioritize comfort."""
-
-INDOOR_ELEC_HEAT_FRACTION: Final = 0.80
-"""Fraction of indoor electricity that becomes heat (lights, cooking, PCs)."""
+"""€/K²/h penalty for being below target. Higher = prioritize comfort over cost."""
 
 FALLBACK_ELEC_PRICE: Final = 0.30
 FALLBACK_OUTDOOR_TEMP: Final = 5.0
 FALLBACK_INTERNAL_GAIN_W: Final = 200.0
+"""Constant internal heat gain from occupants, appliances, etc."""
 
 # ─── Training tuning ─────────────────────────────────────────────────────────
 
@@ -147,10 +106,10 @@ TRAINING_MAX_ITER: Final = 5000
 TRAINING_INITIAL_UA: Final = 150.0
 TRAINING_INITIAL_C: Final = 10.0
 
-# ─── Physical constants ───────────────────────────────────────────────────────
+# Max residual points to store for visualization (covers ~2 days at 15min)
+TRAINING_MAX_RESIDUAL_POINTS: Final = 200
 
-GAS_KWH_PER_M3: Final = 9.769
-"""Dutch Groningen-quality natural gas energy content."""
+# ─── Physical constants ───────────────────────────────────────────────────────
 
 J_PER_KWH: Final = 3_600_000.0
 

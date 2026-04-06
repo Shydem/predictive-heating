@@ -1,35 +1,33 @@
-"""Heating optimizer — decides what to heat and when.
+"""Heating optimizer — decides when to heat and when to save.
 
-Separated from the thermal model so each can be understood and tested alone.
-Every decision is recorded in the trace with full reasoning.
+Simple greedy forward-pass:
+  For each 15-min slot → simulate drift → compute deficit → turn heater on/off.
+
+Cost is based purely on electricity price per kWh (no COP or gas calculations).
+Price-based preheating: if the next slot is significantly more expensive,
+heat a bit extra now to avoid running during the expensive slot.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from .const import (
     COMFORT_PENALTY_WEIGHT,
     DEFAULT_AWAY_TEMP,
-    J_PER_KWH,
     ON_OFF_MIN_DUTY_CYCLE,
     PREHEAT_MAX_OVERSHOOT_K,
     PREHEAT_PRICE_RATIO,
-    SOURCE_ELECTRIC,
 )
 from .model import (
     DeviceDecision,
-    HeatingDevice,
     OptimizationResult,
+    SimpleHeater,
     SlotInput,
     SlotResult,
     ThermalParams,
-    compute_cop,
     compute_heat_deficit_wh,
-    device_cop,
     euler_step,
-    heat_cost_per_wh,
 )
 from .trace import Trace
 
@@ -38,37 +36,28 @@ _LOGGER = logging.getLogger(__name__)
 
 def optimize_heating(
     params: ThermalParams,
-    devices: list[HeatingDevice],
+    heaters: list[SimpleHeater],
     slots: list[SlotInput],
     t_initial: float,
-    cop_a: float,
-    cop_b: float,
-    gas_efficiency: float,
     away_temp: float = DEFAULT_AWAY_TEMP,
 ) -> OptimizationResult:
-    """Find the cheapest heating plan that meets comfort targets.
+    """Find a cheap heating plan that meets comfort targets.
 
-    This is a greedy forward-pass optimizer: for each time slot, it
-    determines the heat deficit, ranks devices by cost, and allocates
-    heating cheapest-first. It looks one slot ahead for preheating
-    opportunities.
+    Greedy forward-pass: process each slot independently, cheapest-first
+    within each slot (though with a single heater there's no ranking needed).
 
     Args:
-        params: Fitted thermal model parameters.
-        devices: Available heating devices.
-        slots: Future time slots with weather/price data.
+        params: Fitted thermal model parameters (UA, C).
+        heaters: List of simple on/off heaters with rated power.
+        slots: Future time slots with outdoor temp and price.
         t_initial: Current indoor temperature.
-        cop_a, cop_b: COP linear coefficients.
-        gas_efficiency: Gas boiler efficiency.
-
-    Returns:
-        OptimizationResult with full per-slot breakdown.
+        away_temp: Setpoint when not heating.
     """
     trace = Trace("optimize")
     trace.step("start", inputs={
         "t_initial": t_initial,
         "n_slots": len(slots),
-        "n_devices": len(devices),
+        "n_heaters": len(heaters),
         "ua": params.ua,
         "thermal_mass": params.thermal_mass,
     })
@@ -84,10 +73,7 @@ def optimize_heating(
             next_slot=slots[i + 1] if i + 1 < len(slots) else None,
             t_current=t_current,
             params=params,
-            devices=devices,
-            cop_a=cop_a,
-            cop_b=cop_b,
-            gas_efficiency=gas_efficiency,
+            heaters=heaters,
             away_temp=away_temp,
             trace=trace,
         )
@@ -113,10 +99,7 @@ def _optimize_one_slot(
     next_slot: SlotInput | None,
     t_current: float,
     params: ThermalParams,
-    devices: list[HeatingDevice],
-    cop_a: float,
-    cop_b: float,
-    gas_efficiency: float,
+    heaters: list[SimpleHeater],
     away_temp: float,
     trace: Trace,
 ) -> SlotResult:
@@ -126,14 +109,13 @@ def _optimize_one_slot(
     1. Simulate temperature drift without heating
     2. Compute heat deficit to reach target
     3. Check if preheating is worthwhile (next slot more expensive?)
-    4. Rank devices by cost per Wh of heat
-    5. Allocate heating cheapest-first
-    6. Simulate actual temperature with allocated heating
+    4. Turn on heaters to cover the deficit, cheapest-first
+    5. Simulate actual temperature with heating
     """
     dt = slot.duration_s
 
-    # Step 1: Where does temperature drift without heating?
-    t_no_heat, q_loss_w, q_net_drift = euler_step(
+    # Step 1: Temperature drift without heating
+    t_no_heat, _, _ = euler_step(
         t_current, slot.t_outdoor, params.ua, params.c_joules,
         q_heating_w=0.0,
         q_solar_w=slot.solar_gain_w,
@@ -141,51 +123,35 @@ def _optimize_one_slot(
         dt_seconds=dt,
     )
 
-    # Step 2: How much heat do we need?
-    deficit_wh = compute_heat_deficit_wh(
-        params.c_joules, slot.t_target, t_no_heat,
-    )
+    # Step 2: Heat deficit
+    deficit_wh = compute_heat_deficit_wh(params.c_joules, slot.t_target, t_no_heat)
 
-    # Step 3: Should we preheat?
+    # Step 3: Preheat check — is next slot significantly more expensive?
     is_preheating = False
     preheat_extra_wh = 0.0
-    preheat_reason = ""
     if next_slot is not None and deficit_wh > 0:
         price_ratio = next_slot.electricity_price / max(slot.electricity_price, 0.001)
         if price_ratio > PREHEAT_PRICE_RATIO:
-            extra_j = params.c_joules * PREHEAT_MAX_OVERSHOOT_K
-            preheat_extra_wh = extra_j / 3600.0
+            preheat_extra_wh = (params.c_joules * PREHEAT_MAX_OVERSHOOT_K) / 3600.0
             is_preheating = True
-            preheat_reason = (
-                f"Next slot {price_ratio:.1f}× more expensive "
-                f"(€{slot.electricity_price:.3f} → €{next_slot.electricity_price:.3f}), "
-                f"preheating {PREHEAT_MAX_OVERSHOOT_K}°C"
-            )
 
     total_need_wh = deficit_wh + preheat_extra_wh
 
-    # Step 4: Rank devices by cost (COP computed per device)
-    ranked = _rank_devices_by_cost(
-        devices, slot.electricity_price, slot.gas_price,
-        slot.t_outdoor, cop_a, cop_b, gas_efficiency,
-    )
+    # Step 4: Allocate heating across heaters (sorted by electricity price — same for all
+    # since they all use electricity, but keeps the door open for multi-price scenarios)
+    cost_per_wh = slot.electricity_price / 1000.0  # €/Wh (electricity only)
+    decisions, _ = _allocate_to_heaters(heaters, total_need_wh, dt, cost_per_wh)
 
-    # Step 5: Allocate heating
-    decisions, remaining_wh = _allocate_heating(
-        ranked, total_need_wh, dt, trace, slot_index,
-    )
-
-    # Step 5b: Compute recommended thermostat setpoint per device
+    # Set recommended setpoints
     for d in decisions:
-        if d.output_pct > 0:
-            if is_preheating:
-                d.recommended_setpoint = round(slot.t_target + PREHEAT_MAX_OVERSHOOT_K, 1)
-            else:
-                d.recommended_setpoint = round(slot.t_target, 1)
+        if d.heating_on:
+            d.recommended_setpoint = round(
+                slot.t_target + (PREHEAT_MAX_OVERSHOOT_K if is_preheating else 0.0), 1
+            )
         else:
             d.recommended_setpoint = round(away_temp, 1)
 
-    # Step 6: Compute actual temperature with allocated heating
+    # Step 5: Simulate temperature with actual heating
     total_heating_w = sum(d.heat_output_w for d in decisions)
     t_after, _, _ = euler_step(
         t_current, slot.t_outdoor, params.ua, params.c_joules,
@@ -198,30 +164,23 @@ def _optimize_one_slot(
     # Comfort penalty for undershoot
     undershoot = max(0.0, slot.t_target - t_after)
     comfort_cost = COMFORT_PENALTY_WEIGHT * (undershoot ** 2) * (dt / 3600.0)
-    energy_cost = sum(
-        d.heat_output_w * (dt / 3600.0) * d.cost_per_wh for d in decisions
-    )
+    energy_cost = total_heating_w * (dt / 3600.0) * cost_per_wh
     total_cost = energy_cost + comfort_cost
 
-    # Trace: only log first slot in detail (the one that matters for control),
-    # plus any slot with warnings
     if slot_index == 0 or is_preheating or undershoot > 0.5:
         trace.step(f"slot_{slot_index}", inputs={
             "t_current": round(t_current, 2),
             "t_outdoor": round(slot.t_outdoor, 1),
             "t_target": round(slot.t_target, 1),
-            "elec_price": round(slot.electricity_price, 4),
+            "price": round(slot.electricity_price, 4),
         }, result={
             "t_no_heat": round(t_no_heat, 2),
             "t_after": round(t_after, 2),
             "deficit_wh": round(deficit_wh, 1),
             "total_heating_w": round(total_heating_w, 0),
-            "energy_cost": round(energy_cost, 4),
-            "comfort_cost": round(comfort_cost, 4),
             "is_preheating": is_preheating,
-            "devices": {d.device_name: f"{d.recommended_setpoint}°C ({d.reason})" for d in decisions},
+            "heaters": {d.device_name: "ON" if d.heating_on else "OFF" for d in decisions},
         }, note=(
-            f"{'PREHEAT: ' + preheat_reason + ' | ' if is_preheating else ''}"
             f"T {t_current:.1f}→{t_after:.1f}°C (target {slot.t_target:.1f}), "
             f"heating {total_heating_w:.0f}W, cost €{energy_cost:.4f}"
         ))
@@ -240,101 +199,54 @@ def _optimize_one_slot(
     )
 
 
-def _rank_devices_by_cost(
-    devices: list[HeatingDevice],
-    elec_price: float,
-    gas_price: float,
-    t_outdoor: float,
-    cop_a: float,
-    cop_b: float,
-    gas_efficiency: float,
-) -> list[tuple[HeatingDevice, float]]:
-    """Rank devices by cost per Wh of heat delivered, cheapest first.
-
-    COP is computed per device from its own data points (or the legacy
-    linear model as fallback).
-
-    Returns list of (device, cost_per_wh) tuples.
-    """
-    ranked = []
-    for dev in devices:
-        cop = device_cop(dev, t_outdoor, cop_a, cop_b)
-        cost = heat_cost_per_wh(
-            dev.energy_source, elec_price, gas_price, cop, gas_efficiency,
-        )
-        ranked.append((dev, cost))
-    ranked.sort(key=lambda x: x[1])
-    return ranked
-
-
-def _allocate_heating(
-    ranked_devices: list[tuple[HeatingDevice, float]],
+def _allocate_to_heaters(
+    heaters: list[SimpleHeater],
     need_wh: float,
     dt_seconds: float,
-    trace: Trace,
-    slot_index: int,
+    cost_per_wh: float,
 ) -> tuple[list[DeviceDecision], float]:
-    """Allocate heating to devices, cheapest first.
+    """Turn on heaters to cover the heat need.
 
-    For on/off devices: only turn on if need > ON_OFF_MIN_DUTY_CYCLE of capacity.
-    For stepless: calculate exact output percentage.
+    All heaters are on/off only (no modulation). They are turned on in
+    order until the deficit is covered. The minimum duty-cycle threshold
+    prevents short-cycling: a heater only turns on if the need exceeds
+    30% of what it can deliver in this slot.
 
     Returns (list of decisions, remaining unmet Wh).
     """
     decisions = []
     remaining = need_wh
 
-    for dev, cost_per_wh in ranked_devices:
-        max_wh = dev.max_output_w * (dt_seconds / 3600.0)
+    for heater in heaters:
+        max_wh = heater.power_w * (dt_seconds / 3600.0)
 
         if remaining <= 0:
             decisions.append(DeviceDecision(
-                device_name=dev.name,
-                output_pct=0.0,
+                device_name=heater.name,
+                heating_on=False,
                 heat_output_w=0.0,
                 cost_per_wh=cost_per_wh,
-                energy_source=dev.energy_source,
                 reason="no heat needed",
             ))
             continue
 
-        if dev.device_type == "on_off":
-            # Only turn on if need exceeds minimum duty cycle
-            threshold = max_wh * ON_OFF_MIN_DUTY_CYCLE
-            if remaining >= threshold:
-                output_wh = max_wh
-                decisions.append(DeviceDecision(
-                    device_name=dev.name,
-                    output_pct=100.0,
-                    heat_output_w=dev.max_output_w,
-                    cost_per_wh=cost_per_wh,
-                    energy_source=dev.energy_source,
-                    reason=f"ON: need {remaining:.0f}Wh > threshold {threshold:.0f}Wh",
-                ))
-            else:
-                output_wh = 0.0
-                decisions.append(DeviceDecision(
-                    device_name=dev.name,
-                    output_pct=0.0,
-                    heat_output_w=0.0,
-                    cost_per_wh=cost_per_wh,
-                    energy_source=dev.energy_source,
-                    reason=f"OFF: need {remaining:.0f}Wh < threshold {threshold:.0f}Wh (short-cycle prevention)",
-                ))
-        else:
-            # Stepless: proportional output
-            output_wh = min(remaining, max_wh)
-            pct = (output_wh / max_wh * 100.0) if max_wh > 0 else 0.0
-            power_w = dev.max_output_w * (pct / 100.0)
+        threshold = max_wh * ON_OFF_MIN_DUTY_CYCLE
+        if remaining >= threshold:
             decisions.append(DeviceDecision(
-                device_name=dev.name,
-                output_pct=round(pct, 1),
-                heat_output_w=round(power_w, 0),
+                device_name=heater.name,
+                heating_on=True,
+                heat_output_w=heater.power_w,
                 cost_per_wh=cost_per_wh,
-                energy_source=dev.energy_source,
-                reason=f"MODULATE: {pct:.1f}% = {output_wh:.0f}Wh of {max_wh:.0f}Wh capacity",
+                reason=f"ON: need {remaining:.0f}Wh > threshold {threshold:.0f}Wh",
             ))
-
-        remaining -= output_wh
+            remaining -= max_wh
+        else:
+            decisions.append(DeviceDecision(
+                device_name=heater.name,
+                heating_on=False,
+                heat_output_w=0.0,
+                cost_per_wh=cost_per_wh,
+                reason=f"OFF: need {remaining:.0f}Wh < short-cycle threshold {threshold:.0f}Wh",
+            ))
 
     return decisions, max(0.0, remaining)

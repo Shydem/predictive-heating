@@ -3,38 +3,44 @@
 #
 # Install: Settings → Dashboards → Add → Edit → Raw config editor → paste
 #
-# Replace placeholder entity IDs (sensor.living_room_temperature etc.)
-# Device sensor names depend on your device names from setup.
-# E.g. device named "Gas Boiler" → sensor.predictive_heating_gas_boiler_*
+# Required HACS cards (install via HACS → Frontend):
+#   - apexcharts-card  (https://github.com/RomRider/apexcharts-card)
+#   - mini-graph-card  (https://github.com/kalkih/mini-graph-card)
+#
+# Replace placeholder entity IDs:
+#   sensor.living_room_temperature  → your indoor temp sensor
+#   sensor.outdoor_temperature      → your outdoor temp sensor
+#   sensor.nordpool_kwh_nl_eur      → your electricity price sensor
+#
+# Device sensor names match your device name from setup.
+# E.g. heater named "Heater" → sensor.predictive_heating_heater_*
 ###############################################################################
 
 title: Predictive Heating
 views:
+
+  # ── Overview ─────────────────────────────────────────────────────────────────
   - title: Overview
     path: overview
     icon: mdi:home-thermometer
     type: sections
     sections:
+
       - title: Current Status
         type: grid
         cards:
           - type: entity
             entity: sensor.predictive_heating_current_target_temperature
             name: Target
-
-          # ← Replace with your actual indoor temp sensor
           - type: entity
-            entity: sensor.living_room_temperature
-            name: Indoor
-
-          # ← Replace with your actual outdoor temp sensor
-          - type: entity
-            entity: sensor.outdoor_temperature
-            name: Outdoor
-
+            entity: sensor.living_room_temperature   # ← replace
+            name: Indoor (Actual)
           - type: entity
             entity: sensor.predictive_heating_predicted_temperature
-            name: Predicted
+            name: Indoor (Predicted)
+          - type: entity
+            entity: sensor.outdoor_temperature        # ← replace
+            name: Outdoor
 
       - title: Model Health
         type: grid
@@ -62,203 +68,277 @@ views:
             entity: sensor.predictive_heating_next_model_training
             name: Next Training
 
+      - title: Heater Control
+        type: grid
+        cards:
+          # Duplicate this block for each heater you configured
+          - type: entity
+            entity: sensor.predictive_heating_heater_recommended_state
+            name: Heater — Recommended
+            state_color: true
+          - type: entity
+            entity: sensor.predictive_heating_heater_recommended_setpoint
+            name: Heater — Setpoint
+          - type: entity
+            entity: sensor.predictive_heating_heater_heat_output
+            name: Heater — Heat (W)
+
       - title: Cost
         type: grid
         cards:
           - type: entity
             entity: sensor.predictive_heating_estimated_heating_cost_24h
-            name: Estimated 24h Cost
+            name: Estimated 24h Cost (€)
+          - type: entity
+            entity: sensor.nordpool_kwh_nl_eur    # ← replace
+            name: Electricity Price (€/kWh)
 
-          # ← Replace with your Nordpool entity
-          - type: entity
-            entity: sensor.nordpool_kwh_nl_eur
-            name: Electricity Price
-
-      # ── Duplicate per device ──
-      - title: "Gas Boiler"
-        type: grid
-        cards:
-          - type: entity
-            entity: sensor.predictive_heating_gas_boiler_recommended_state
-            name: Recommended
-            state_color: true
-          - type: gauge
-            entity: sensor.predictive_heating_gas_boiler_recommended_output
-            name: Output
-            min: 0
-            max: 100
-            unit: "%"
-          - type: entity
-            entity: sensor.predictive_heating_gas_boiler_heat_output
-            name: Heat (W)
-
-      - title: "Heat Pump"
-        type: grid
-        cards:
-          - type: entity
-            entity: sensor.predictive_heating_heat_pump_recommended_state
-            name: Recommended
-            state_color: true
-          - type: gauge
-            entity: sensor.predictive_heating_heat_pump_recommended_output
-            name: Output
-            min: 0
-            max: 100
-            unit: "%"
-          - type: entity
-            entity: sensor.predictive_heating_heat_pump_heat_output
-            name: Heat (W)
-
-  - title: Graphs
-    path: graphs
+  # ── Live Graphs ───────────────────────────────────────────────────────────────
+  - title: Live
+    path: live
     icon: mdi:chart-line
     type: sections
     sections:
-      - title: Temperature (24h)
+
+      - title: Temperature — Last 24h
         type: grid
         cards:
-          - type: history-graph
-            hours_to_show: 24
-            entities:
-              - entity: sensor.living_room_temperature
-                name: Indoor Actual
+          - type: custom:apexcharts-card
+            header:
+              title: Indoor Temperature vs Target
+              show: true
+            graph_span: 24h
+            series:
+              - entity: sensor.living_room_temperature    # ← replace
+                name: Measured
+                color: "#1976D2"
+                stroke_width: 2
               - entity: sensor.predictive_heating_predicted_temperature
-                name: Predicted
+                name: Model Prediction
+                color: "#FF6F00"
+                stroke_width: 2
+                stroke_dash: 4
               - entity: sensor.predictive_heating_current_target_temperature
                 name: Target
-              - entity: sensor.outdoor_temperature
+                color: "#43A047"
+                stroke_width: 1
+                stroke_dash: 8
+              - entity: sensor.outdoor_temperature         # ← replace
                 name: Outdoor
+                color: "#90A4AE"
+                stroke_width: 1
+            yaxis:
+              - min: ~5
+                max: ~25
 
-      - title: Temperature (7 days)
+      - title: Heater State — Last 24h
         type: grid
         cards:
-          - type: history-graph
-            hours_to_show: 168
-            entities:
-              - entity: sensor.living_room_temperature
-                name: Indoor
-              - entity: sensor.predictive_heating_predicted_temperature
-                name: Predicted
-              - entity: sensor.outdoor_temperature
-                name: Outdoor
+          - type: custom:apexcharts-card
+            header:
+              title: Heater On/Off
+              show: true
+            graph_span: 24h
+            chart_type: bar
+            series:
+              - entity: sensor.predictive_heating_heater_heat_output
+                name: Heat Output (W)
+                color: "#E53935"
+                type: column
 
-      - title: Device Activity (24h)
+      - title: Electricity Price — Today
         type: grid
         cards:
-          - type: history-graph
-            hours_to_show: 24
-            entities:
-              - entity: sensor.predictive_heating_gas_boiler_recommended_state
-                name: Boiler
-              - entity: sensor.predictive_heating_heat_pump_recommended_state
-                name: Heat Pump
-          - type: history-graph
-            hours_to_show: 24
-            entities:
-              - entity: sensor.predictive_heating_gas_boiler_heat_output
-                name: Boiler (W)
-              - entity: sensor.predictive_heating_heat_pump_heat_output
-                name: Heat Pump (W)
+          - type: custom:apexcharts-card
+            header:
+              title: Electricity Price (€/kWh)
+              show: true
+            graph_span: 48h
+            series:
+              - entity: sensor.nordpool_kwh_nl_eur    # ← replace
+                name: Price
+                color: "#7B1FA2"
+                type: column
+                group_by:
+                  func: last
+                  duration: 1h
 
-      - title: Model Parameters (30 days)
+  # ── Training Visualization ────────────────────────────────────────────────────
+  - title: Training
+    path: training
+    icon: mdi:brain
+    type: sections
+    sections:
+
+      - title: Measured vs Predicted Temperature (Training Data)
         type: grid
         cards:
-          - type: history-graph
-            hours_to_show: 720
-            entities:
+          - type: markdown
+            content: >
+              ### How to read this chart
+
+              The **Training Visualization** sensor stores arrays of measured vs
+              predicted indoor temperature from the last training run.
+
+              - **Blue line** = what the thermometer actually measured
+              - **Orange dashed line** = what the model would have predicted with the fitted UA and C
+              - Good fit: lines track each other closely (R² > 0.8)
+              - Poor fit: lines diverge, especially during heating events
+
+          - type: custom:apexcharts-card
+            header:
+              title: Training Fit — Measured vs Predicted
+              show: true
+            chart_type: line
+            series:
+              - entity: sensor.predictive_heating_training_visualization
+                name: Measured
+                color: "#1976D2"
+                stroke_width: 2
+                data_generator: |
+                  return entity.attributes.residuals
+                    ? entity.attributes.residuals.map(r => [new Date(r.ts).getTime(), r.measured])
+                    : [];
+              - entity: sensor.predictive_heating_training_visualization
+                name: Predicted (model)
+                color: "#FF6F00"
+                stroke_width: 2
+                stroke_dash: 4
+                data_generator: |
+                  return entity.attributes.residuals
+                    ? entity.attributes.residuals.map(r => [new Date(r.ts).getTime(), r.predicted])
+                    : [];
+            yaxis:
+              - min: ~10
+                max: ~25
+
+      - title: Residuals (Prediction Errors)
+        type: grid
+        cards:
+          - type: markdown
+            content: >
+              ### Residuals = Measured − Predicted
+
+              Random scatter around zero = good model.
+              Systematic drift = the model is missing something
+              (solar gain, occupancy patterns, etc.)
+
+          - type: custom:apexcharts-card
+            header:
+              title: Training Residuals (°C error over time)
+              show: true
+            chart_type: line
+            series:
+              - entity: sensor.predictive_heating_training_visualization
+                name: Error (°C)
+                color: "#E53935"
+                stroke_width: 1
+                data_generator: |
+                  return entity.attributes.residuals
+                    ? entity.attributes.residuals.map(r => [new Date(r.ts).getTime(), r.error])
+                    : [];
+            yaxis:
+              - min: ~-3
+                max: ~3
+
+      - title: Model Parameters History
+        type: grid
+        cards:
+          - type: custom:apexcharts-card
+            header:
+              title: UA and Thermal Mass Over Time
+              show: true
+            graph_span: 90d
+            series:
               - entity: sensor.predictive_heating_heat_loss_coefficient_ua
                 name: UA (W/K)
+                color: "#1976D2"
+                stroke_width: 2
               - entity: sensor.predictive_heating_model_fit_r2
-                name: R²
+                name: R² × 100 (proxy)
+                color: "#43A047"
+                stroke_width: 1
+                transform: "return x * 100"
 
-      - title: Cost
+      - title: Training Summary
         type: grid
         cards:
-          - type: history-graph
-            hours_to_show: 168
-            entities:
-              - entity: sensor.predictive_heating_estimated_heating_cost_24h
-                name: 24h Cost (€)
+          - type: entity
+            entity: sensor.predictive_heating_training_visualization
+            name: Training Quality
 
+          - type: markdown
+            content: >
+              **How the model learns:**
+
+              1. Every {{training_interval}} days it reads the last 30 days
+                 of temperature history and heater on/off states
+              2. It fits two numbers — **UA** (heat loss, W/K) and
+                 **C** (thermal mass, kWh/K) — by minimizing prediction error
+              3. R² > 0.8 means the model explains 80%+ of temperature variation
+
+              **If R² is low:**
+              - Check the heater power_w setting (too high/low?)
+              - Verify the heater entity state reports on/off correctly
+              - Try excluding anomalous periods (sensor outages)
+
+  # ── 24h Forecast ─────────────────────────────────────────────────────────────
+  - title: Forecast
+    path: forecast
+    icon: mdi:weather-partly-cloudy
+    type: sections
+    sections:
+
+      - title: 24h Temperature Forecast
+        type: grid
+        cards:
+          - type: custom:apexcharts-card
+            header:
+              title: Predicted Temperature + Heating Plan
+              show: true
+            chart_type: line
+            series:
+              - entity: sensor.predictive_heating_24h_temperature_forecast
+                name: Predicted Indoor
+                color: "#FF6F00"
+                stroke_width: 2
+                data_generator: |
+                  const ts = entity.attributes.timestamps || [];
+                  const temps = entity.attributes.predicted_temps || [];
+                  return ts.map((t, i) => [new Date(t).getTime(), temps[i]]);
+              - entity: sensor.predictive_heating_24h_temperature_forecast
+                name: Target
+                color: "#43A047"
+                stroke_width: 1
+                stroke_dash: 8
+                data_generator: |
+                  const ts = entity.attributes.timestamps || [];
+                  const targets = entity.attributes.target_temps || [];
+                  return ts.slice(0, targets.length).map((t, i) => [new Date(t).getTime(), targets[i]]);
+            yaxis:
+              - min: ~10
+                max: ~25
+
+          - type: custom:apexcharts-card
+            header:
+              title: Planned Heating (W)
+              show: true
+            chart_type: bar
+            series:
+              - entity: sensor.predictive_heating_24h_temperature_forecast
+                name: Heat Output (W)
+                color: "#E53935"
+                data_generator: |
+                  const ts = entity.attributes.timestamps || [];
+                  const watts = entity.attributes.heating_watts || [];
+                  return ts.slice(0, watts.length).map((t, i) => [new Date(t).getTime(), watts[i]]);
+
+  # ── Debug ─────────────────────────────────────────────────────────────────────
   - title: Debug
     path: debug
     icon: mdi:bug-outline
     type: sections
     sections:
-      - title: Prediction Visualization
-        type: grid
-        cards:
-          - type: entity
-            entity: sensor.predictive_heating_24h_temperature_forecast
-            name: 24h Forecast
-            
-          - type: entity
-            entity: sensor.predictive_heating_optimization_debug_info
-            name: Optimization Debug
-
-      - title: Custom Graph (ApexCharts)
-        type: grid
-        cards:
-          - type: custom:apexcharts-card
-            header:
-              title: 24h Temperature Prediction
-              show: true
-            graph:
-              span:
-                unit: hour
-            series:
-              - entity: sensor.living_room_temperature
-                name: Indoor Actual
-                type: line
-              - entity: sensor.predictive_heating_predicted_temperature
-                name: Predicted
-                type: line
-              - entity: sensor.outdoor_temperature
-                name: Outdoor
-                type: line
-              - entity: sensor.predictive_heating_current_target_temperature
-                name: Target
-                type: line
-                stroke_width: 2
-                color: orange
-            yaxis:
-              min: 10
-              max: 25
-
-      - title: Decision Trace (Live Optimization)
-        type: grid
-        cards:
-          - type: entity
-            entity: sensor.predictive_heating_decision_trace
-            name: Last Optimization Step
-
-          - type: markdown
-            content: >-
-              ## View Detailed Trace Data
-
-              Click on `sensor.predictive_heating_decision_trace`
-              in the **Developer Tools → States** panel.
-
-              **Key attributes:**
-
-              - `optimization`: Full list of optimization steps with:
-                - Time, slot number, calculations
-                - Device decisions (on/off, output %)
-                - Cost vs comfort trade-offs
-                - Temperature predictions per slot
-
-              - `training` (if recently trained):
-                - Data collection quality
-                - Model fit (R²)
-                - Training error breakdown
-
-              **To enable debug logging:**
-
-              ```yaml
-              logger:
-                logs:
-                  custom_components.predictive_heating: debug
-              ```
 
       - title: Manual Controls
         type: grid
@@ -270,27 +350,35 @@ views:
               action: perform-action
               perform_action: predictive_heating.train_model
           - type: button
-            name: Get Forecast
-            icon: mdi:chart-timeline-variant
-            tap_action:
-              action: perform-action
-              perform_action: predictive_heating.get_forecast
-          - type: button
             name: Force Optimization
             icon: mdi:flash
             tap_action:
               action: perform-action
               perform_action: predictive_heating.force_optimization
+          - type: button
+            name: Get Forecast
+            icon: mdi:chart-timeline-variant
+            tap_action:
+              action: perform-action
+              perform_action: predictive_heating.get_forecast
 
-      - title: Diagnostics
+      - title: Decision Trace
         type: grid
         cards:
+          - type: entity
+            entity: sensor.predictive_heating_decision_trace
+            name: Last Optimization
+
           - type: markdown
-            content: >-
-              ## Full diagnostics dump
+            content: >
+              Click `sensor.predictive_heating_decision_trace` in
+              **Developer Tools → States** to see the full step-by-step
+              reasoning the optimizer used.
 
-              Go to **Settings → Devices → Predictive Heating →
-              three dots → Download diagnostics**.
+              Enable debug logging for more detail:
 
-              This exports config, model parameters, traces, and
-              data quality — everything needed to debug issues.
+              ```yaml
+              logger:
+                logs:
+                  custom_components.predictive_heating: debug
+              ```

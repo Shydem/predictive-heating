@@ -12,6 +12,10 @@ Rearranged for a forward Euler step:
 
 Where:
     Q_net = Q_heating + Q_solar + Q_internal − UA × (T_old − T_outdoor)
+
+Two parameters are fitted from historical data:
+    UA  — heat loss coefficient in W/K  (bigger = leakier house)
+    C   — thermal capacitance in kWh/K  (bigger = slower to heat/cool)
 """
 
 from __future__ import annotations
@@ -19,18 +23,17 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
 
 import numpy as np
 from scipy.optimize import minimize
 
 from .const import (
-    GAS_KWH_PER_M3,
     J_PER_KWH,
     TRAINING_C_BOUNDS,
     TRAINING_INITIAL_C,
     TRAINING_INITIAL_UA,
     TRAINING_MAX_ITER,
+    TRAINING_MAX_RESIDUAL_POINTS,
     TRAINING_MIN_POINTS,
     TRAINING_UA_BOUNDS,
 )
@@ -72,16 +75,19 @@ class ThermalParams:
 
 
 @dataclass
-class HeatingDevice:
-    """One physical heating device."""
+class SimpleHeater:
+    """A heating device with a known constant power output.
+
+    Heat output is binary: either power_w watts (when on) or 0 W (when off).
+    The on/off state is read from the HA entity at each timestep.
+    """
 
     name: str
     entity_id: str
-    device_type: str  # "on_off" or "stepless"
-    energy_source: str  # "gas" or "electric"
-    max_output_w: float
-    cop_data_points: list[tuple[float, float]] = field(default_factory=list)
-    """COP curve as (outdoor_temp, COP) pairs. Only used for electric devices."""
+    """HA switch, climate, or binary_sensor entity to read state from."""
+
+    power_w: float
+    """Rated heat output in watts. Use the nameplate value."""
 
 
 @dataclass
@@ -93,21 +99,19 @@ class SlotInput:
     t_outdoor: float
     t_target: float
     electricity_price: float
-    gas_price: float
     solar_gain_w: float = 0.0
     internal_gain_w: float = 200.0
 
 
 @dataclass
 class DeviceDecision:
-    """What the optimizer decided for one device in one slot."""
+    """What the optimizer decided for one heater in one slot."""
 
     device_name: str
-    output_pct: float  # 0-100
+    heating_on: bool
     heat_output_w: float
     cost_per_wh: float
-    energy_source: str
-    reason: str  # human-readable explanation
+    reason: str
     recommended_setpoint: float = 15.0
     """Temperature setpoint to send to this device's thermostat."""
 
@@ -164,80 +168,6 @@ def euler_step(
     return t_new, q_loss_w, q_net_w
 
 
-def compute_cop(t_outdoor: float, cop_a: float, cop_b: float) -> float:
-    """Heat pump COP at given outdoor temperature (legacy linear model).
-
-    COP = cop_a + cop_b × T_outdoor, floored at 1.0.
-    """
-    return max(1.0, cop_a + cop_b * t_outdoor)
-
-
-def interpolate_cop(
-    data_points: list[tuple[float, float]], t_outdoor: float
-) -> float:
-    """Heat pump COP by piecewise linear interpolation of manufacturer data.
-
-    data_points: sorted list of (outdoor_temp_°C, COP) tuples from spec sheet.
-    Clamps to the nearest value outside the data range.
-    Returns at least 1.0.
-    """
-    if not data_points:
-        return 3.0  # safe default if somehow empty
-
-    pts = sorted(data_points, key=lambda p: p[0])
-
-    # Below lowest data point — clamp
-    if t_outdoor <= pts[0][0]:
-        return max(1.0, pts[0][1])
-
-    # Above highest data point — clamp
-    if t_outdoor >= pts[-1][0]:
-        return max(1.0, pts[-1][1])
-
-    # Interpolate between bracketing points
-    for i in range(1, len(pts)):
-        if pts[i][0] >= t_outdoor:
-            t0, cop0 = pts[i - 1]
-            t1, cop1 = pts[i]
-            span = t1 - t0
-            if span <= 0:
-                return max(1.0, cop0)
-            frac = (t_outdoor - t0) / span
-            return max(1.0, cop0 + frac * (cop1 - cop0))
-
-    return max(1.0, pts[-1][1])
-
-
-def device_cop(
-    device: HeatingDevice, t_outdoor: float,
-    cop_a: float = 2.8, cop_b: float = 0.05,
-) -> float:
-    """Get COP for a device: use its data points if available, else legacy linear."""
-    if device.cop_data_points:
-        return interpolate_cop(device.cop_data_points, t_outdoor)
-    return compute_cop(t_outdoor, cop_a, cop_b)
-
-
-def heat_cost_per_wh(
-    source: str,
-    electricity_price: float,
-    gas_price: float,
-    cop: float,
-    gas_efficiency: float,
-) -> float:
-    """Cost in €/Wh of heat delivered by a device.
-
-    For electric:  elec_price_per_kwh / (COP × 1000)
-    For gas:       gas_price_per_m3 / (energy_content × efficiency × 1000)
-    The ×1000 converts €/kWh to €/Wh.
-    """
-    if source == "electric":
-        return electricity_price / (cop * 1000.0) if cop > 0 else 999.0
-    # gas_price is in €/m³; convert via energy content (kWh/m³)
-    gas_kwh_price = gas_price / GAS_KWH_PER_M3  # €/kWh of gas
-    return gas_kwh_price / (gas_efficiency * 1000.0) if gas_efficiency > 0 else 999.0
-
-
 def compute_heat_deficit_wh(
     c_joules: float, t_target: float, t_without_heating: float
 ) -> float:
@@ -262,11 +192,15 @@ def train_model(
     q_solar_w: list[float],
     q_internal_w: list[float],
     trace: Trace | None = None,
-) -> ThermalParams:
+) -> tuple[ThermalParams, list[dict]]:
     """Fit UA and thermal_mass from historical data.
 
     Uses least-squares: simulate forward from measured data,
     minimize sum of squared errors vs actual indoor temperature.
+
+    Returns:
+        (ThermalParams, residuals) where residuals is a list of dicts:
+        [{ts, measured, predicted, error}] — useful for visualization.
     """
     if trace is None:
         trace = Trace("training")
@@ -278,7 +212,7 @@ def train_model(
         trace.warn("insufficient_data",
             f"Need {TRAINING_MIN_POINTS} points, got {n}. Returning defaults.",
             points=n)
-        return ThermalParams()
+        return ThermalParams(), []
 
     # Time deltas between consecutive samples
     dts = np.array([
@@ -301,19 +235,22 @@ def train_model(
 
     eval_count = [0]
 
-    def residual(x: np.ndarray) -> float:
-        ua, c_kwh_k = x[0], x[1]
+    def simulate(ua: float, c_kwh_k: float) -> np.ndarray:
+        """Simulate indoor temperature trajectory for given UA and C."""
         c = c_kwh_k * J_PER_KWH
-        if ua <= 0 or c <= 0:
-            return 1e12
-
         predicted = np.empty(n)
         predicted[0] = t_in[0]
         for i in range(1, n):
             q_loss = ua * (predicted[i - 1] - t_out[i - 1])
             q_net = q_heat[i - 1] + q_solar[i - 1] + q_int[i - 1] - q_loss
             predicted[i] = predicted[i - 1] + (q_net / c) * dts[i - 1]
+        return predicted
 
+    def residual(x: np.ndarray) -> float:
+        ua, c_kwh_k = x[0], x[1]
+        if ua <= 0 or c_kwh_k <= 0:
+            return 1e12
+        predicted = simulate(ua, c_kwh_k)
         eval_count[0] += 1
         return float(np.sum((t_in[1:] - predicted[1:]) ** 2))
 
@@ -333,7 +270,8 @@ def train_model(
     c_fit = float(np.clip(result.x[1], *TRAINING_C_BOUNDS))
 
     # Compute R²
-    ss_res = result.fun
+    predicted_final = simulate(ua_fit, c_fit)
+    ss_res = float(np.sum((t_in[1:] - predicted_final[1:]) ** 2))
     ss_tot = float(np.sum((t_in[1:] - np.mean(t_in[1:])) ** 2))
     r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
@@ -356,8 +294,21 @@ def train_model(
 
     if r2 < 0.5:
         trace.warn("low_r_squared",
-            f"R²={r2:.3f} is low. Model explains less than half the temperature "
-            "variation. Check sensor data quality or consider adding solar gain.",
+            f"R²={r2:.3f} is low. Check sensor data quality or heater power rating.",
             r_squared=r2)
 
-    return params
+    # Build residuals array for visualization
+    # Sample evenly to stay within HA attribute size limits
+    errors = t_in[1:] - predicted_final[1:]
+    step = max(1, (n - 1) // TRAINING_MAX_RESIDUAL_POINTS)
+    residuals = [
+        {
+            "ts": timestamps[i + 1].isoformat(),
+            "measured": round(float(t_in[i + 1]), 2),
+            "predicted": round(float(predicted_final[i + 1]), 2),
+            "error": round(float(errors[i]), 3),
+        }
+        for i in range(0, n - 1, step)
+    ]
+
+    return params, residuals
