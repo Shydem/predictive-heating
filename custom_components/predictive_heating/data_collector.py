@@ -132,17 +132,23 @@ async def collect_training_data(
     now = datetime.now()
     start = now - timedelta(days=window_days)
 
+    def _normalize_entity_id(value: Any) -> str:
+        """Normalize entity ID to string (handle multi-select lists)."""
+        if isinstance(value, list):
+            return value[0] if value else ""
+        return str(value) if value else ""
+
     entity_map = {
-        "indoor": config[CONF_INDOOR_TEMP_ENTITY],
-        "outdoor": config[CONF_OUTDOOR_TEMP_ENTITY],
+        "indoor": _normalize_entity_id(config[CONF_INDOOR_TEMP_ENTITY]),
+        "outdoor": _normalize_entity_id(config[CONF_OUTDOOR_TEMP_ENTITY]),
     }
-    gas_entity = config.get(CONF_GAS_CONSUMPTION_ENTITY, "")
+    gas_entity = _normalize_entity_id(config.get(CONF_GAS_CONSUMPTION_ENTITY, ""))
     if gas_entity:
         entity_map["gas"] = gas_entity
-    elec_entity = config.get(CONF_TOTAL_ELECTRICITY_ENTITY, "")
+    elec_entity = _normalize_entity_id(config.get(CONF_TOTAL_ELECTRICITY_ENTITY, ""))
     if elec_entity:
         entity_map["elec_total"] = elec_entity
-    hp_entity = config.get(CONF_HEATPUMP_ELECTRICITY_ENTITY, "")
+    hp_entity = _normalize_entity_id(config.get(CONF_HEATPUMP_ELECTRICITY_ENTITY, ""))
     if hp_entity:
         entity_map["hp_elec"] = hp_entity
 
@@ -152,11 +158,19 @@ async def collect_training_data(
         "resample": f"{resample_minutes} min",
     })
 
-    # Fetch from recorder
-    entity_ids = list(entity_map.values())
-    history = await get_instance(hass).async_add_executor_job(
-        state_changes_during_period, hass, start, now, entity_ids,
-    )
+    # Fetch from recorder (pass only non-empty entity IDs, one at a time)
+    history: dict[str, list] = {}
+    for label, entity_id in entity_map.items():
+        if not entity_id:
+            continue
+        try:
+            entity_history = await get_instance(hass).async_add_executor_job(
+                state_changes_during_period, hass, start, now, entity_id,
+            )
+            history[entity_id] = entity_history.get(entity_id, [])
+        except Exception as err:
+            _LOGGER.warning(f"Failed to fetch history for {entity_id}: {err}")
+            history[entity_id] = []
 
     # Parse into sorted (timestamp, float) series
     raw: dict[str, list[tuple[datetime, float]]] = {}

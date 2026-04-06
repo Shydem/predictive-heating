@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -220,28 +220,86 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # ── Electricity prices ────────────────────────────────────────────────────
 
-    def _get_prices(self) -> list[tuple[datetime, float]]:
+    async def _fetch_official_nordpool_prices(self) -> list[tuple[datetime, float]]:
+        """Fetch prices from official HA Nord Pool integration using service call.
+
+        The official nordpool integration provides nordpool.get_prices_for_date
+        service which returns prices in the response.
+        """
+        try:
+            now = dt_util.now()
+            today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            prices: list[tuple[datetime, float]] = []
+
+            # Try to call nordpool service for today and tomorrow
+            for day_offset in [0, 1]:
+                target_date = (today + timedelta(days=day_offset)).date()
+                try:
+                    response = await self.hass.services.async_call(
+                        "nordpool",
+                        "get_prices_for_date",
+                        {"date": target_date.isoformat()},
+                        blocking=True,
+                        return_response=True,
+                    )
+                    if response and "prices" in response:
+                        for item in response["prices"]:
+                            try:
+                                # Official nordpool service typically returns:
+                                # {time: datetime, price: float}
+                                item_time = item.get("time")
+                                if isinstance(item_time, str):
+                                    item_time = datetime.fromisoformat(item_time)
+                                price_val = float(item.get("price", 0))
+                                prices.append((item_time, price_val))
+                            except (ValueError, TypeError):
+                                pass
+                except Exception:
+                    # Service might not exist or returned an error, continue
+                    pass
+
+            if prices:
+                _LOGGER.debug(
+                    "Fetched %d prices via official Nord Pool service", len(prices)
+                )
+                return sorted(prices, key=lambda x: x[0])
+
+        except Exception as err:
+            _LOGGER.debug("Official Nord Pool service call failed: %s", err)
+
+        return []
+
+    async def _get_prices(self) -> list[tuple[datetime, float]]:
         """Read electricity prices from multiple possible integrations.
 
         Supports (in detection order):
-        1. Custom Nordpool HACS: raw_today/raw_tomorrow attributes
+        1. Official Nord Pool HA integration (nordpool.get_prices_for_date service)
+        2. Custom Nordpool HACS: raw_today/raw_tomorrow attributes
            [{start, end, value}, ...]
-        2. ENTSO-e HACS: prices/prices_today/prices_tomorrow attributes
+        3. ENTSO-e HACS: prices/prices_today/prices_tomorrow attributes
            [{time, price}, ...]
-        3. Any sensor with today/tomorrow plain list attributes
-        4. Fallback: current sensor state as flat rate for 48h
+        4. Any sensor with today/tomorrow plain list attributes
+        5. Fallback: current sensor state as flat rate for 48h
         """
         entity_id = self.config.get(CONF_ELECTRICITY_PRICE_ENTITY, "")
         state = self.hass.states.get(entity_id) if entity_id else None
+
+        prices: list[tuple[datetime, float]] = []
+
+        # ── Strategy 1: Try official Nord Pool service first ────────────────
+        official_prices = await self._fetch_official_nordpool_prices()
+        if official_prices:
+            return official_prices
+
         if state is None:
             return []
 
-        prices: list[tuple[datetime, float]] = []
         attrs = state.attributes
         now = dt_util.now()
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # ── Strategy 1: Custom Nordpool HACS (raw_today / raw_tomorrow) ───
+        # ── Strategy 2: Custom Nordpool HACS (raw_today / raw_tomorrow) ───
         raw_today = attrs.get("raw_today")
         raw_tomorrow = attrs.get("raw_tomorrow")
         if isinstance(raw_today, list) and raw_today:
@@ -256,7 +314,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 return sorted(prices, key=lambda x: x[0])
 
-        # ── Strategy 2: ENTSO-e HACS (prices attribute) ──────────────────
+        # ── Strategy 3: ENTSO-e HACS (prices attribute) ──────────────────
         entsoe_prices = attrs.get("prices")
         if isinstance(entsoe_prices, list) and entsoe_prices:
             prices.extend(self._parse_raw_price_list(entsoe_prices))
@@ -277,7 +335,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return sorted(prices, key=lambda x: x[0])
 
-        # ── Strategy 3: Plain list attributes (today / tomorrow) ──────────
+        # ── Strategy 4: Plain list attributes (today / tomorrow) ──────────
         for day_offset, key in [(0, "today"), (1, "tomorrow")]:
             data = attrs.get(key)
             if isinstance(data, list):
@@ -339,13 +397,56 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return prices
 
     def _price_at(self, prices: list[tuple[datetime, float]], t: datetime) -> float:
-        """Interpolate price at time t."""
+        """Interpolate price at time t, handling timezone-aware and naive datetimes.
+
+        Handles mixed timezone-aware/naive datetimes by normalizing to comparable form.
+        """
         if not prices:
             return FALLBACK_ELEC_PRICE
-        for i in range(len(prices) - 1):
-            if prices[i][0] <= t < prices[i + 1][0]:
-                return prices[i][1]
-        return prices[-1][1]
+
+        # Determine if we're dealing with aware or naive datetimes
+        is_aware = prices[0][0].tzinfo is not None if prices else False
+
+        try:
+            # Normalize all datetimes to the same form
+            if is_aware and t.tzinfo is None:
+                # Prices are aware, t is naive — make t UTC-aware
+                t_normalized = t.replace(tzinfo=timezone.utc)
+            elif not is_aware and t.tzinfo is not None:
+                # Prices are naive, t is aware — strip timezone from t
+                t_normalized = t.replace(tzinfo=None)
+            else:
+                # Already compatible
+                t_normalized = t
+
+            for i in range(len(prices) - 1):
+                p_start = prices[i][0]
+                p_end = prices[i + 1][0]
+
+                # Normalize price times to match t_normalized
+                if is_aware and p_start.tzinfo is None:
+                    p_start = p_start.replace(tzinfo=timezone.utc)
+                elif not is_aware and p_start.tzinfo is not None:
+                    p_start = p_start.replace(tzinfo=None)
+
+                if is_aware and p_end.tzinfo is None:
+                    p_end = p_end.replace(tzinfo=timezone.utc)
+                elif not is_aware and p_end.tzinfo is not None:
+                    p_end = p_end.replace(tzinfo=None)
+
+                if p_start <= t_normalized < p_end:
+                    return prices[i][1]
+
+            return prices[-1][1]
+        except TypeError:
+            # Fallback: strip all timezone info and compare
+            t_naive = t.replace(tzinfo=None)
+            for i in range(len(prices) - 1):
+                p0_naive = prices[i][0].replace(tzinfo=None)
+                p1_naive = prices[i + 1][0].replace(tzinfo=None)
+                if p0_naive <= t_naive < p1_naive:
+                    return prices[i][1]
+            return prices[-1][1] if prices else FALLBACK_ELEC_PRICE
 
     # ── Training ──────────────────────────────────────────────────────────────
 
@@ -471,7 +572,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         gas_price = self.config.get(CONF_GAS_PRICE, DEFAULT_GAS_PRICE)
         dt_s = timestep * 60.0
         n_slots = int(horizon * 60 / timestep)
-        prices = self._get_prices()
+        prices = await self._get_prices()
 
         # Fetch weather forecast (non-blocking, falls back gracefully)
         forecast_available = False
