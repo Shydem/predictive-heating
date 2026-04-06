@@ -14,6 +14,7 @@ from typing import Any
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.history import state_changes_during_period
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_COP_COEFFICIENTS,
@@ -129,7 +130,8 @@ async def collect_training_data(
     if trace is None:
         trace = Trace("data_collect")
 
-    now = datetime.now()
+    # Use dt_util.now() to get timezone-aware datetime (matches recorder data)
+    now = dt_util.now()
     start = now - timedelta(days=window_days)
 
     def _normalize_entity_id(value: Any) -> str:

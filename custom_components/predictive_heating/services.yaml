@@ -27,6 +27,10 @@ get_forecast:
   name: Get Heating Forecast
   description: Returns the optimized heating plan with predicted temperatures.
 
+force_optimization:
+  name: Force Optimization
+  description: Trigger an immediate optimization calculation and update all sensors (useful for testing without waiting 5 minutes).
+
 set_model_params:
   name: Set Model Parameters
   description: >-

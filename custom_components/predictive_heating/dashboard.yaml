@@ -185,41 +185,80 @@ views:
     icon: mdi:bug-outline
     type: sections
     sections:
-      - title: Decision Trace
+      - title: Prediction Visualization
+        type: grid
+        cards:
+          - type: entity
+            entity: sensor.predictive_heating_24h_temperature_forecast
+            name: 24h Forecast
+            
+          - type: entity
+            entity: sensor.predictive_heating_optimization_debug_info
+            name: Optimization Debug
+
+      - title: Custom Graph (ApexCharts)
+        type: grid
+        cards:
+          - type: custom:apexcharts-card
+            header:
+              title: 24h Temperature Prediction
+              show: true
+            graph:
+              span:
+                unit: hour
+            series:
+              - entity: sensor.living_room_temperature
+                name: Indoor Actual
+                type: line
+              - entity: sensor.predictive_heating_predicted_temperature
+                name: Predicted
+                type: line
+              - entity: sensor.outdoor_temperature
+                name: Outdoor
+                type: line
+              - entity: sensor.predictive_heating_current_target_temperature
+                name: Target
+                type: line
+                stroke_width: 2
+                color: orange
+            yaxis:
+              min: 10
+              max: 25
+
+      - title: Decision Trace (Live Optimization)
         type: grid
         cards:
           - type: entity
             entity: sensor.predictive_heating_decision_trace
-            name: Last Optimization
+            name: Last Optimization Step
 
           - type: markdown
             content: >-
-              ## How to read the trace
+              ## View Detailed Trace Data
 
-              Open **Developer Tools → States** and find
-              `sensor.predictive_heating_decision_trace`.
-              The attributes contain:
+              Click on `sensor.predictive_heating_decision_trace`
+              in the **Developer Tools → States** panel.
 
-              - **optimization.last_steps**: the last 10 optimizer decisions
-                with full inputs/outputs and human-readable notes
+              **Key attributes:**
 
-              - **training**: data collection stats, model fit details,
-                convergence info
+              - `optimization`: Full list of optimization steps with:
+                - Time, slot number, calculations
+                - Device decisions (on/off, output %)
+                - Cost vs comfort trade-offs
+                - Temperature predictions per slot
 
-              Each device state sensor also has a **reason** attribute
-              explaining why it's on or off.
+              - `training` (if recently trained):
+                - Data collection quality
+                - Model fit (R²)
+                - Training error breakdown
 
-              ### Enable full debug logging
-
-              Add to `configuration.yaml`:
+              **To enable debug logging:**
 
               ```yaml
               logger:
                 logs:
                   custom_components.predictive_heating: debug
               ```
-
-              This logs every single trace step to the HA log.
 
       - title: Manual Controls
         type: grid
@@ -236,6 +275,12 @@ views:
             tap_action:
               action: perform-action
               perform_action: predictive_heating.get_forecast
+          - type: button
+            name: Force Optimization
+            icon: mdi:flash
+            tap_action:
+              action: perform-action
+              perform_action: predictive_heating.force_optimization
 
       - title: Diagnostics
         type: grid

@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant, ServiceCall
 
 from .const import (
     DOMAIN, PLATFORMS, SERVICE_GET_FORECAST, SERVICE_SET_MODEL_PARAMS,
-    SERVICE_SET_SCHEDULE, SERVICE_TRAIN_MODEL,
+    SERVICE_SET_SCHEDULE, SERVICE_TRAIN_MODEL, SERVICE_FORCE_OPTIMIZATION,
 )
 from .coordinator import PredictiveHeatingCoordinator
 
@@ -76,6 +76,11 @@ def _register_services(hass: HomeAssistant) -> None:
             entry.runtime_data.set_model_params(ua=ua, thermal_mass=thermal_mass)
             await entry.runtime_data.async_request_refresh()
 
+    async def handle_force_optimization(call: ServiceCall) -> None:
+        """Force immediate optimization/update without waiting for the 5-min interval."""
+        for entry in hass.config_entries.async_entries(DOMAIN):
+            await entry.runtime_data.async_request_refresh()
+
     if not hass.services.has_service(DOMAIN, SERVICE_TRAIN_MODEL):
         hass.services.async_register(
             DOMAIN, SERVICE_TRAIN_MODEL, handle_train,
@@ -95,3 +100,4 @@ def _register_services(hass: HomeAssistant) -> None:
                 vol.Optional("thermal_mass"): vol.Coerce(float),
             }),
         )
+        hass.services.async_register(DOMAIN, SERVICE_FORCE_OPTIMIZATION, handle_force_optimization)

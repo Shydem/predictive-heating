@@ -114,6 +114,10 @@ async def async_setup_entry(
     # Debug trace sensor — shows the full optimization reasoning
     entities.append(DebugTraceSensor(coordinator, entry))
 
+    # Debug visualization sensors for graphs
+    entities.append(PredictionHorizonSensor(coordinator, entry))
+    entities.append(OptimizationDetailsSensor(coordinator, entry))
+
     # Per-device sensors
     for device in coordinator.devices:
         entities.append(DeviceSetpointSensor(coordinator, device.name, entry))
@@ -358,3 +362,137 @@ class DeviceSetpointSensor(CoordinatorEntity[PredictiveHeatingCoordinator], Sens
             "current_outdoor": data.get("t_outdoor"),
             "cost_per_wh": dev.get("cost_per_wh"),
         }
+
+
+class PredictionHorizonSensor(CoordinatorEntity[PredictiveHeatingCoordinator], SensorEntity):
+    """Shows the predicted temperature trajectory over the next 24 hours.
+
+    Attributes contain arrays suitable for graphing:
+    - timestamps: list of ISO 8601 timestamps
+    - predicted_temps: list of predicted indoor temperatures
+    - system_state: list of heating system recommendations
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "24h Temperature Forecast"
+    _attr_icon = "mdi:chart-line"
+
+    def __init__(
+        self, coordinator: PredictiveHeatingCoordinator, entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_prediction_horizon"
+        self._attr_device_info = _device_info(entry)
+        self._temperature_history: list[dict] = []
+
+    @property
+    def native_value(self) -> str | None:
+        """Summary of current forecast."""
+        if self.coordinator.last_optimization is None:
+            return "No forecast available"
+        temps = self.coordinator.last_optimization.predicted_temperatures
+        if not temps:
+            return "No data"
+        final_temp = temps[-1] if temps else None
+        current_temp = self.coordinator.data.get("t_indoor") if self.coordinator.data else None
+        return f"Currently {current_temp:.1f}°C → Forecast {final_temp:.1f}°C" if final_temp and current_temp else "No forecast"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Detailed forecast arrays for graphing."""
+        if self.coordinator.last_optimization is None:
+            return None
+
+        attrs: dict[str, Any] = {}
+
+        # Predicted temperatures over time
+        temps = self.coordinator.last_optimization.predicted_temperatures
+        if temps:
+            # Assume 15-minute intervals starting from now
+            from datetime import datetime, timedelta
+            from homeassistant.util import dt as dt_util
+            now = dt_util.now()
+            timestamps = [
+                (now + timedelta(minutes=i * 15)).isoformat()
+                for i in range(len(temps))
+            ]
+            attrs["timestamps"] = timestamps
+            attrs["predicted_temperatures"] = [round(t, 2) for t in temps]
+
+        # Device heating state over forecast window
+        if self.coordinator.last_optimization.slot_results:
+            system_states = []
+            for slot in self.coordinator.last_optimization.slot_results:
+                active_devices = []
+                for device_decision in slot.device_decisions:
+                    if device_decision.output_pct > 0:
+                        active_devices.append({
+                            "name": device_decision.device_name,
+                            "output_pct": round(device_decision.output_pct, 1),
+                            "heat_w": round(device_decision.heat_output_w, 0),
+                        })
+                system_states.append(active_devices if active_devices else None)
+            attrs["heating_plan"] = system_states
+
+        # Cost forecast
+        attrs["total_cost_24h"] = round(self.coordinator.last_optimization.total_cost, 4)
+
+        return attrs if attrs else None
+
+
+class OptimizationDetailsSensor(CoordinatorEntity[PredictiveHeatingCoordinator], SensorEntity):
+    """Detailed optimization behavior for debugging.
+
+    Shows what the optimizer decided and why, including:
+    - Comfort vs cost trade-off
+    - Energy prices used
+    - Thermal load calculations
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Optimization Debug Info"
+    _attr_icon = "mdi:bug"
+
+    def __init__(
+        self, coordinator: PredictiveHeatingCoordinator, entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_optimization_debug"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> str | None:
+        """One-line status of optimization."""
+        if self.coordinator.last_optimization is None:
+            return "Pending first optimization"
+        opt = self.coordinator.last_optimization
+        n_slots = len(opt.slot_results) if opt.slot_results else 0
+        return f"Optimized {n_slots} slots, cost €{opt.total_cost:.2f}"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Detailed debug info for analysis."""
+        attrs: dict[str, Any] = {}
+
+        if self.coordinator.data:
+            data = self.coordinator.data
+            attrs["current_indoor_temp"] = data.get("t_indoor")
+            attrs["current_outdoor_temp"] = data.get("t_outdoor")
+            attrs["target_temperature"] = data.get("current_target")
+            attrs["n_training_points"] = data.get("n_training_points")
+            attrs["model_fit_r2"] = data.get("model_fit_r2")
+
+        if self.coordinator.last_optimization:
+            opt = self.coordinator.last_optimization
+            attrs["total_cost_24h"] = round(opt.total_cost, 4)
+            attrs["final_predicted_temp"] = (
+                round(opt.predicted_temperatures[-1], 2)
+                if opt.predicted_temperatures else None
+            )
+            attrs["n_slots_optimized"] = len(opt.slot_results) if opt.slot_results else 0
+
+        if self.coordinator.last_optimize_trace:
+            trace = self.coordinator.last_optimize_trace
+            attrs["optimization_trace"] = trace
+
+        return attrs if attrs else None
