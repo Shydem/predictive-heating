@@ -91,6 +91,25 @@ FALLBACK_OUTDOOR_TEMP: Final = 5.0
 FALLBACK_INTERNAL_GAIN_W: Final = 200.0
 """Constant internal heat gain from occupants, appliances, etc."""
 
+# ─── Gas heating source (Phase 1) ────────────────────────────────────────────
+
+CONF_GAS_CONSUMPTION_ENTITY: Final = "gas_consumption_entity"
+"""Cumulative gas meter entity (m³). Used to derive Q_heating when available.
+Typically sensor.gas_consumption from the DSMR/P1 integration.
+Falls back to heater on/off × power_w when not configured."""
+
+CONF_GAS_EFFICIENCY: Final = "gas_efficiency"
+"""Boiler thermal efficiency (0–1). Default 0.90 for a modern HR boiler."""
+
+CONF_TRAINING_USE_CONSTANT_OUTDOOR: Final = "use_constant_outdoor_temp"
+"""Phase 1: use mean outdoor temperature as a constant during training.
+This simplifies the regression and makes Phase 1 more robust when outdoor
+data is sparse. Disable for Phase 2 (time-varying outdoor temp)."""
+
+DEFAULT_GAS_EFFICIENCY: Final = 0.90
+GAS_KWH_PER_M3: Final = 9.77
+"""Lower heating value of Dutch natural gas in kWh/m³ (Groningen quality)."""
+
 # ─── Training tuning ─────────────────────────────────────────────────────────
 
 TRAINING_MIN_POINTS: Final = 20

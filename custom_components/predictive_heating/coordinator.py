@@ -32,6 +32,7 @@ from .const import (
     CONF_PREDICTION_HORIZON_HOURS,
     CONF_TEMPERATURE_SCHEDULE,
     CONF_TRAINING_INTERVAL_DAYS,
+    CONF_TRAINING_USE_CONSTANT_OUTDOOR,
     CONF_TRAINING_WINDOW_DAYS,
     CONF_WEATHER_ENTITY,
     DEFAULT_AWAY_TEMP,
@@ -75,6 +76,8 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_optimize_trace: dict[str, Any] | None = None
         self.last_training_residuals: list[dict] = []
         """Per-timestep residuals from last training run, for visualization."""
+        self.last_training_inputs: dict[str, Any] = {}
+        """Sampled raw training inputs (temps, heating) for TrainingInputSensor."""
 
         # Persistence
         self._storage_path = os.path.join(
@@ -122,6 +125,9 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         if data.get("last_trained") else None
                     ),
                     n_data_points=data.get("n_data_points", 0),
+                    t_outdoor_avg_training=data.get("t_outdoor_avg_training"),
+                    training_mode=data.get("training_mode", "phase2_variable_outdoor"),
+                    q_heating_source=data.get("q_heating_source", "heater_onoff"),
                 )
                 _LOGGER.info("Loaded saved model: %s", self.params.describe())
                 return
@@ -163,6 +169,9 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         if self.params.last_trained else None
                     ),
                     "n_data_points": self.params.n_data_points,
+                    "t_outdoor_avg_training": self.params.t_outdoor_avg_training,
+                    "training_mode": self.params.training_mode,
+                    "q_heating_source": self.params.q_heating_source,
                 }, f, indent=2)
         except Exception as err:
             _LOGGER.error("Could not save model params: %s", err)
@@ -400,14 +409,32 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.last_training_trace = trace.summary()
                 return
 
+            use_constant_outdoor = bool(
+                self.config.get(CONF_TRAINING_USE_CONSTANT_OUTDOOR, True)
+            )
+
             params, residuals = await self.hass.async_add_executor_job(
                 train_model,
                 data.timestamps, data.t_indoor, data.t_outdoor,
                 data.q_heating_w, data.q_solar_w, data.q_internal_w,
+                use_constant_outdoor,
+                data.q_heating_source,
                 trace,
             )
             self.params = params
             self.last_training_residuals = residuals
+
+            # Store sampled input arrays for TrainingInputSensor
+            self.last_training_inputs = {
+                "timestamps": data.viz_timestamps,
+                "t_indoor": data.viz_t_indoor,
+                "t_outdoor": data.viz_t_outdoor,
+                "q_heating_w": data.viz_q_heating_w,
+                "q_heating_source": data.q_heating_source,
+                "n_points": data.n_points,
+                "coverage_pct": round(data.quality.coverage_pct, 1),
+            }
+
             self._save_params()
             _LOGGER.info("Training complete: %s", self.params.describe())
 
@@ -555,6 +582,10 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "devices": first_slot_decisions,
             "weather_forecast_available": forecast_available,
             "solar_gain_current_w": round(slots[0].solar_gain_w, 0) if slots else 0,
+            # Phase 1 metadata
+            "training_mode": self.params.training_mode,
+            "q_heating_source": self.params.q_heating_source,
+            "t_outdoor_avg_training": self.params.t_outdoor_avg_training,
         }
 
     async def _apply_setpoints(self, decisions: dict[str, dict]) -> None:

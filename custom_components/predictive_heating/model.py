@@ -61,6 +61,16 @@ class ThermalParams:
     last_trained: datetime | None = None
     n_data_points: int = 0
 
+    # Phase 1 metadata
+    t_outdoor_avg_training: float | None = None
+    """Mean outdoor temperature used in training. Set when use_constant_outdoor=True."""
+
+    training_mode: str = "phase2_variable_outdoor"
+    """Which training mode was used: 'phase1_constant_outdoor' or 'phase2_variable_outdoor'."""
+
+    q_heating_source: str = "heater_onoff"
+    """How Q_heating was derived: 'gas' or 'heater_onoff'."""
+
     @property
     def c_joules(self) -> float:
         """Thermal capacitance in J/K (SI units for calculations)."""
@@ -70,7 +80,8 @@ class ThermalParams:
         """Human-readable summary."""
         return (
             f"UA={self.ua:.1f} W/K, C={self.thermal_mass:.1f} kWh/K, "
-            f"R²={self.r_squared:.3f}, trained on {self.n_data_points} points"
+            f"R²={self.r_squared:.3f}, trained on {self.n_data_points} points "
+            f"[{self.training_mode}, Q from {self.q_heating_source}]"
         )
 
 
@@ -191,12 +202,19 @@ def train_model(
     q_heating_w: list[float],
     q_solar_w: list[float],
     q_internal_w: list[float],
+    use_constant_outdoor: bool = False,
+    q_heating_source: str = "heater_onoff",
     trace: Trace | None = None,
 ) -> tuple[ThermalParams, list[dict]]:
     """Fit UA and thermal_mass from historical data.
 
     Uses least-squares: simulate forward from measured data,
     minimize sum of squared errors vs actual indoor temperature.
+
+    Args:
+        use_constant_outdoor: Phase 1 mode. Replace per-timestep outdoor temp
+            with its mean. Simplifies the fit when outdoor data is sparse.
+        q_heating_source: How Q_heating was derived ('gas' or 'heater_onoff').
 
     Returns:
         (ThermalParams, residuals) where residuals is a list of dicts:
@@ -206,7 +224,7 @@ def train_model(
         trace = Trace("training")
 
     n = len(timestamps)
-    trace.step("start", inputs={"data_points": n})
+    trace.step("start", inputs={"data_points": n, "use_constant_outdoor": use_constant_outdoor})
 
     if n < TRAINING_MIN_POINTS:
         trace.warn("insufficient_data",
@@ -226,11 +244,22 @@ def train_model(
     q_solar = np.array(q_solar_w, dtype=np.float64)
     q_int = np.array(q_internal_w, dtype=np.float64)
 
+    # Phase 1: replace time-varying outdoor with a single mean value
+    t_outdoor_avg: float | None = None
+    if use_constant_outdoor:
+        t_outdoor_avg = float(np.mean(t_out))
+        t_out = np.full(n, t_outdoor_avg)
+        trace.step("phase1_constant_outdoor", result={
+            "t_outdoor_avg": round(t_outdoor_avg, 2),
+            "t_outdoor_original_range": f"{float(np.array(t_outdoor).min()):.1f}–{float(np.array(t_outdoor).max()):.1f} °C",
+        }, note=f"Using T_outdoor = {t_outdoor_avg:.2f}°C constant (Phase 1 mode)")
+
     trace.step("data_stats", result={
         "t_indoor_range": f"{t_in.min():.1f} – {t_in.max():.1f} °C",
         "t_outdoor_range": f"{t_out.min():.1f} – {t_out.max():.1f} °C",
         "mean_heating_w": f"{q_heat.mean():.0f} W",
         "total_hours": f"{dts.sum() / 3600:.1f}",
+        "q_heating_source": q_heating_source,
     })
 
     eval_count = [0]
@@ -281,6 +310,9 @@ def train_model(
         r_squared=r2,
         last_trained=datetime.now(),
         n_data_points=n,
+        t_outdoor_avg_training=t_outdoor_avg,
+        training_mode="phase1_constant_outdoor" if use_constant_outdoor else "phase2_variable_outdoor",
+        q_heating_source=q_heating_source,
     )
 
     trace.step("optimize_done", result={

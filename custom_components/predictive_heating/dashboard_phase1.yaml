@@ -1,0 +1,537 @@
+# Predictive Heating — Phase 1 Verification Dashboard
+#
+# This dashboard answers the question: "does the model work?"
+# It shows every step of the Phase 1 training pipeline:
+#
+#   Training Inputs  → what data the model saw
+#   Model Fit        → how well the model reproduced that data
+#   Parameters       → the fitted UA and C values
+#   Errors           → residuals (should be small and random)
+#   Scatter          → predicted vs measured (should be diagonal)
+#
+# HOW TO USE:
+#   Settings → Dashboards → Add Dashboard → YAML mode → paste this file
+#   Or: place in /config/ui-lovelace.yaml and reload
+#
+# REQUIREMENTS:
+#   HACS → Frontend → ApexCharts Card
+#   HACS → Frontend → mushroom (optional, for pretty summary cards)
+#
+# ENTITY IDs — replace if yours differ:
+#   sensor.predictive_heating_training_visualization
+#   sensor.predictive_heating_training_inputs
+#   sensor.altherma_climatecontrol_ruimte_temperatuur
+#   sensor.altherma_climatecontrol_buiten_temperatuur
+#   sensor.predictive_heating_comfoclime_recommended_setpoint
+#   sensor.predictive_heating_comfoclime_heat_output
+
+title: Predictive Heating — Phase 1
+views:
+  # ════════════════════════════════════════════════════════════
+  - title: Training Fit
+    icon: mdi:chart-line
+    path: training-fit
+    cards:
+
+      # ── Row 1: Model quality at a glance ─────────────────────
+      - type: horizontal-stack
+        cards:
+          - type: entity
+            entity: sensor.predictive_heating_heat_loss_coefficient_ua
+            name: Heat Loss (UA)
+            icon: mdi:home-thermometer-outline
+            unit: W/K
+
+          - type: entity
+            entity: sensor.predictive_heating_thermal_mass
+            name: Thermal Mass (C)
+            icon: mdi:weight
+            unit: kWh/K
+
+          - type: entity
+            entity: sensor.predictive_heating_model_fit_r
+            name: Model Fit R²
+            icon: mdi:chart-bell-curve-cumulative
+
+          - type: attribute
+            entity: sensor.predictive_heating_training_visualization
+            attribute: rmse_k
+            name: RMSE (K)
+            icon: mdi:sigma
+
+          - type: attribute
+            entity: sensor.predictive_heating_training_visualization
+            attribute: training_mode
+            name: Training Mode
+            icon: mdi:cog
+
+      # ── Row 2: Phase 1 constant outdoor info ─────────────────
+      - type: horizontal-stack
+        cards:
+          - type: attribute
+            entity: sensor.predictive_heating_training_visualization
+            attribute: t_outdoor_avg
+            name: T_outdoor Constant Used (°C)
+            icon: mdi:thermometer-low
+
+          - type: attribute
+            entity: sensor.predictive_heating_training_visualization
+            attribute: q_heating_source
+            name: Heating Source
+            icon: mdi:fire
+
+          - type: attribute
+            entity: sensor.predictive_heating_training_visualization
+            attribute: n_training_points
+            name: Training Points
+            icon: mdi:database
+
+          - type: entity
+            entity: sensor.predictive_heating_next_model_training
+            name: Next Training
+            icon: mdi:brain
+
+      # ── Chart 1: Measured vs Predicted Temperature ───────────
+      # The most important chart: if the red line tracks the blue line,
+      # the model has correctly learned your house's thermal behaviour.
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Measured vs Predicted Indoor Temperature
+          show_states: true
+          colorize_states: true
+        graph_span: 30d
+        now:
+          show: true
+          label: Now
+        apex_config:
+          chart:
+            height: 300
+          stroke:
+            width: [2, 2]
+            dashArray: [0, 6]
+          tooltip:
+            shared: true
+          yaxis:
+            title:
+              text: Temperature (°C)
+        series:
+          - name: Measured
+            color: "#2196F3"
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.residuals_timestamps) return [];
+              return attrs.residuals_timestamps.map((ts, i) => [
+                new Date(ts).getTime(),
+                attrs.residuals_measured[i]
+              ]);
+            entity: sensor.predictive_heating_training_visualization
+            type: line
+
+          - name: Predicted
+            color: "#F44336"
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.residuals_timestamps) return [];
+              return attrs.residuals_timestamps.map((ts, i) => [
+                new Date(ts).getTime(),
+                attrs.residuals_predicted[i]
+              ]);
+            entity: sensor.predictive_heating_training_visualization
+            type: line
+
+      # ── Chart 2: Prediction Errors Over Time ─────────────────
+      # These are the residuals: measured − predicted.
+      # A good model has errors centred around 0 with no drift.
+      # Systematic drift means the model is missing something (e.g. solar gain).
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Prediction Errors (Residuals) — should be centred at 0
+          show_states: false
+        graph_span: 30d
+        apex_config:
+          chart:
+            height: 200
+            type: bar
+          colors:
+            - "#FF9800"
+          yaxis:
+            title:
+              text: Error (K)
+          annotations:
+            yaxis:
+              - y: 0
+                borderColor: "#666"
+                strokeDashArray: 4
+        series:
+          - name: Error (K)
+            entity: sensor.predictive_heating_training_visualization
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.residuals_timestamps) return [];
+              return attrs.residuals_timestamps.map((ts, i) => [
+                new Date(ts).getTime(),
+                attrs.residuals_errors[i]
+              ]);
+            type: column
+
+  # ════════════════════════════════════════════════════════════
+  - title: Training Inputs
+    icon: mdi:database-eye
+    path: training-inputs
+    cards:
+
+      # ── Input data summary ────────────────────────────────────
+      - type: horizontal-stack
+        cards:
+          - type: entity
+            entity: sensor.predictive_heating_training_inputs
+            name: Data Status
+            icon: mdi:database-check
+
+          - type: attribute
+            entity: sensor.predictive_heating_training_inputs
+            attribute: n_points
+            name: Total Points
+            icon: mdi:counter
+
+          - type: attribute
+            entity: sensor.predictive_heating_training_inputs
+            attribute: coverage_pct
+            name: Coverage (%)
+            icon: mdi:percent
+
+          - type: attribute
+            entity: sensor.predictive_heating_training_inputs
+            attribute: q_heating_source
+            name: Q Source
+            icon: mdi:fire
+
+      # ── Chart 3: Indoor & Outdoor Temperature History ─────────
+      # Shows the raw temperature data fed into the model.
+      # Both sensors should have good, continuous data.
+      # The T_outdoor_avg constant (Phase 1) is shown as a flat line for reference.
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Training Temperature History
+          show_states: true
+          colorize_states: true
+        graph_span: 30d
+        apex_config:
+          chart:
+            height: 300
+          stroke:
+            width: [2, 2, 1]
+            dashArray: [0, 0, 6]
+          tooltip:
+            shared: true
+          yaxis:
+            title:
+              text: Temperature (°C)
+        series:
+          - name: Indoor
+            color: "#E91E63"
+            entity: sensor.predictive_heating_training_inputs
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.timestamps) return [];
+              return attrs.timestamps.map((ts, i) => [
+                new Date(ts).getTime(),
+                attrs.t_indoor[i]
+              ]);
+            type: line
+
+          - name: Outdoor (actual)
+            color: "#00BCD4"
+            entity: sensor.predictive_heating_training_inputs
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.timestamps) return [];
+              return attrs.timestamps.map((ts, i) => [
+                new Date(ts).getTime(),
+                attrs.t_outdoor[i]
+              ]);
+            type: line
+
+          - name: T_outdoor avg (Phase 1 constant)
+            color: "#9E9E9E"
+            entity: sensor.predictive_heating_training_visualization
+            data_generator: |
+              const inputAttrs = states['sensor.predictive_heating_training_inputs'].attributes;
+              const vizAttrs = entity.attributes;
+              const avg = vizAttrs.t_outdoor_avg;
+              if (!inputAttrs.timestamps || avg == null) return [];
+              return inputAttrs.timestamps.map(ts => [
+                new Date(ts).getTime(),
+                avg
+              ]);
+            type: line
+
+      # ── Chart 4: Heat Input Timeline ─────────────────────────
+      # Shows when and how much heat was injected into the house.
+      # Gas source: continuous kW values.
+      # Heater on/off: step function (0 or rated power).
+      # Cross-check: temperature should rise when Q_heating is high.
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Heat Input During Training Window
+          show_states: true
+          colorize_states: true
+        graph_span: 30d
+        apex_config:
+          chart:
+            height: 250
+          stroke:
+            width: [0]
+          fill:
+            opacity: [0.7]
+          yaxis:
+            title:
+              text: Heat Input (W)
+        series:
+          - name: Q_heating (W)
+            color: "#FF5722"
+            entity: sensor.predictive_heating_training_inputs
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.timestamps) return [];
+              return attrs.timestamps.map((ts, i) => [
+                new Date(ts).getTime(),
+                attrs.q_heating_w[i]
+              ]);
+            type: area
+
+      # ── Chart 5: Indoor Temp + Heat Input Overlay ─────────────
+      # The key sanity check: every time Q_heating spikes, does
+      # indoor temperature rise shortly after? If yes, the model
+      # has real signal to learn from. If not, check heater entity IDs.
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Temperature Response to Heating (Sanity Check)
+        graph_span: 7d
+        apex_config:
+          chart:
+            height: 300
+          stroke:
+            width: [2, 1]
+          yaxis:
+            - id: temp
+              title:
+                text: Indoor Temp (°C)
+              opposite: false
+            - id: heat
+              title:
+                text: Heat Input (W)
+              opposite: true
+              max: 20000
+          tooltip:
+            shared: true
+        series:
+          - name: Indoor Temp
+            color: "#E91E63"
+            entity: sensor.predictive_heating_training_inputs
+            yaxis_id: temp
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.timestamps) return [];
+              // Last 7 days = roughly last 1/4 of points if window=30d
+              const start = attrs.timestamps.length - Math.ceil(attrs.timestamps.length / 4);
+              return attrs.timestamps.slice(start).map((ts, i) => [
+                new Date(ts).getTime(),
+                attrs.t_indoor[start + i]
+              ]);
+            type: line
+
+          - name: Q_heating
+            color: "#FF5722"
+            entity: sensor.predictive_heating_training_inputs
+            yaxis_id: heat
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.timestamps) return [];
+              const start = attrs.timestamps.length - Math.ceil(attrs.timestamps.length / 4);
+              return attrs.timestamps.slice(start).map((ts, i) => [
+                new Date(ts).getTime(),
+                attrs.q_heating_w[start + i]
+              ]);
+            type: area
+
+  # ════════════════════════════════════════════════════════════
+  - title: Model Scatter
+    icon: mdi:chart-scatter-plot
+    path: model-scatter
+    cards:
+
+      # ── Explanation ───────────────────────────────────────────
+      - type: markdown
+        content: |
+          ## Predicted vs Measured Scatter Plot
+          Each point is one training timestep (15 min).
+          **X axis** = what the model *predicted* the indoor temperature to be.
+          **Y axis** = what the indoor sensor actually *measured*.
+
+          **A good model** produces a tight diagonal line (predicted ≈ measured).
+          - Points above the diagonal → model underestimates (house is warmer than predicted)
+          - Points below the diagonal → model overestimates (house is cooler than predicted)
+          - Wide scatter → poor fit (R² low), check sensor data quality
+
+      # ── Chart 6: Scatter Predicted vs Measured ────────────────
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Predicted vs Measured — should be diagonal
+        apex_config:
+          chart:
+            height: 400
+            type: scatter
+          xaxis:
+            title:
+              text: Predicted Temperature (°C)
+          yaxis:
+            title:
+              text: Measured Temperature (°C)
+          markers:
+            size: 3
+            strokeWidth: 0
+          tooltip:
+            x:
+              formatter: "function(val) { return val.toFixed(2) + ' °C (predicted)'; }"
+            y:
+              formatter: "function(val) { return val.toFixed(2) + ' °C (measured)'; }"
+        series:
+          - name: Training points
+            color: "#673AB7"
+            entity: sensor.predictive_heating_training_visualization
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.residuals_predicted) return [];
+              return attrs.residuals_predicted.map((pred, i) => ({
+                x: pred,
+                y: attrs.residuals_measured[i]
+              }));
+
+      # ── Chart 7: Error distribution ───────────────────────────
+      - type: markdown
+        content: |
+          ## Error Statistics
+          R² = 1.0 is perfect. R² > 0.8 is excellent. R² > 0.65 is acceptable.
+          RMSE = root mean squared error in Kelvin. < 0.5 K is excellent.
+
+      - type: horizontal-stack
+        cards:
+          - type: attribute
+            entity: sensor.predictive_heating_training_visualization
+            attribute: r_squared
+            name: R² (fit quality)
+            icon: mdi:chart-bell-curve
+
+          - type: attribute
+            entity: sensor.predictive_heating_training_visualization
+            attribute: rmse_k
+            name: RMSE (K)
+            icon: mdi:sigma
+
+          - type: attribute
+            entity: sensor.predictive_heating_training_visualization
+            attribute: ua_w_per_k
+            name: UA (W/K)
+            icon: mdi:thermometer-minus
+
+          - type: attribute
+            entity: sensor.predictive_heating_training_visualization
+            attribute: thermal_mass_kwh_per_k
+            name: C (kWh/K)
+            icon: mdi:weight
+
+  # ════════════════════════════════════════════════════════════
+  - title: Live
+    icon: mdi:home-thermometer
+    path: live
+    cards:
+
+      # ── Current state ─────────────────────────────────────────
+      - type: horizontal-stack
+        cards:
+          - type: entity
+            entity: sensor.altherma_climatecontrol_ruimte_temperatuur
+            name: Indoor Now
+            icon: mdi:home-thermometer
+
+          - type: entity
+            entity: sensor.altherma_climatecontrol_buiten_temperatuur
+            name: Outdoor Now
+            icon: mdi:thermometer
+
+          - type: entity
+            entity: sensor.predictive_heating_current_target_temperature
+            name: Target
+            icon: mdi:thermostat
+
+          - type: entity
+            entity: sensor.predictive_heating_comfoclime_recommended_setpoint
+            name: Recommended Setpoint
+            icon: mdi:thermostat-auto
+
+          - type: entity
+            entity: sensor.predictive_heating_comfoclime_heat_output
+            name: Heat Output
+            icon: mdi:radiator
+
+      # ── 24h Forecast ──────────────────────────────────────────
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: 24h Temperature Forecast
+          show_states: true
+          colorize_states: true
+        apex_config:
+          chart:
+            height: 280
+          stroke:
+            width: [2, 1, 1]
+            dashArray: [0, 4, 0]
+          tooltip:
+            shared: true
+          yaxis:
+            title:
+              text: Temperature (°C)
+        series:
+          - name: Predicted Indoor
+            color: "#E91E63"
+            entity: sensor.predictive_heating_24h_temperature_forecast
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.timestamps) return [];
+              return attrs.timestamps.map((ts, i) => [
+                new Date(ts).getTime(),
+                attrs.predicted_temps[i]
+              ]);
+            type: line
+
+          - name: Target
+            color: "#4CAF50"
+            entity: sensor.predictive_heating_24h_temperature_forecast
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.timestamps) return [];
+              return attrs.timestamps.map((ts, i) => [
+                new Date(ts).getTime(),
+                attrs.target_temps[i]
+              ]);
+            type: line
+
+          - name: Outdoor Forecast
+            color: "#00BCD4"
+            entity: sensor.predictive_heating_24h_temperature_forecast
+            data_generator: |
+              const attrs = entity.attributes;
+              if (!attrs.timestamps) return [];
+              return attrs.timestamps.map((ts, i) => [
+                new Date(ts).getTime(),
+                attrs.outdoor_temps[i]
+              ]);
+            type: line

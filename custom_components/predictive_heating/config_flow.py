@@ -19,6 +19,8 @@ from .const import (
     CONF_DEVICE_NAME,
     CONF_DEVICE_POWER_W,
     CONF_ELECTRICITY_PRICE_ENTITY,
+    CONF_GAS_CONSUMPTION_ENTITY,
+    CONF_GAS_EFFICIENCY,
     CONF_HEATING_DEVICES,
     CONF_HOUSE_FLOOR_AREA_M2,
     CONF_HOUSE_INSULATION,
@@ -31,9 +33,11 @@ from .const import (
     CONF_PREDICTION_HORIZON_HOURS,
     CONF_TEMPERATURE_SCHEDULE,
     CONF_TRAINING_INTERVAL_DAYS,
+    CONF_TRAINING_USE_CONSTANT_OUTDOOR,
     CONF_TRAINING_WINDOW_DAYS,
     CONF_WEATHER_ENTITY,
     DEFAULT_AWAY_TEMP,
+    DEFAULT_GAS_EFFICIENCY,
     DEFAULT_OPTIMIZATION_TIMESTEP_MIN,
     DEFAULT_PREDICTION_HORIZON_HOURS,
     DEFAULT_TEMPERATURE_SCHEDULE,
@@ -92,6 +96,8 @@ class PredictiveHeatingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     selector.EntitySelectorConfig(domain="sensor")),
                 vol.Optional(CONF_WEATHER_ENTITY): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="weather")),
+                vol.Optional(CONF_GAS_CONSUMPTION_ENTITY): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor")),
             }),
             errors=errors,
         )
@@ -162,6 +168,9 @@ class PredictiveHeatingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     selector.NumberSelectorConfig(min=1, max=48, step=1)),
                 vol.Optional(CONF_OPTIMIZATION_TIMESTEP_MIN, default=DEFAULT_OPTIMIZATION_TIMESTEP_MIN): selector.NumberSelector(
                     selector.NumberSelectorConfig(min=5, max=60, step=5)),
+                vol.Optional(CONF_TRAINING_USE_CONSTANT_OUTDOOR, default=True): selector.BooleanSelector(),
+                vol.Optional(CONF_GAS_EFFICIENCY, default=DEFAULT_GAS_EFFICIENCY): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0.5, max=1.0, step=0.01)),
             }),
         )
 
@@ -235,5 +244,11 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(CONF_PREDICTION_HORIZON_HOURS,
                     default=current.get(CONF_PREDICTION_HORIZON_HOURS, DEFAULT_PREDICTION_HORIZON_HOURS)):
                     selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=48, step=1)),
+                vol.Optional(CONF_TRAINING_USE_CONSTANT_OUTDOOR,
+                    default=current.get(CONF_TRAINING_USE_CONSTANT_OUTDOOR, True)):
+                    selector.BooleanSelector(),
+                vol.Optional(CONF_GAS_EFFICIENCY,
+                    default=current.get(CONF_GAS_EFFICIENCY, DEFAULT_GAS_EFFICIENCY)):
+                    selector.NumberSelector(selector.NumberSelectorConfig(min=0.5, max=1.0, step=0.01)),
             }),
         )

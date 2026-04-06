@@ -111,6 +111,7 @@ async def async_setup_entry(
 
     # Visualization sensors
     entities.append(TrainingVisualizationSensor(coordinator, entry))
+    entities.append(TrainingInputSensor(coordinator, entry))
     entities.append(PredictionHorizonSensor(coordinator, entry))
     entities.append(DebugTraceSensor(coordinator, entry))
 
@@ -217,8 +218,13 @@ class TrainingVisualizationSensor(CoordinatorEntity[PredictiveHeatingCoordinator
     def extra_state_attributes(self) -> dict[str, Any]:
         """Graph data for ApexCharts.
 
-        residuals  → area/line chart: overlay measured vs predicted temperature
-        scatter    → scatter chart: outdoor temp vs delta-T, colored by heater state
+        residuals  → line chart: overlay measured vs predicted temperature
+        errors     → bar chart: prediction error over time (should be ~0)
+
+        Phase 1 extras:
+        training_mode     → 'phase1_constant_outdoor' or 'phase2_variable_outdoor'
+        t_outdoor_avg     → constant outdoor temp used in Phase 1 training
+        q_heating_source  → 'gas' or 'heater_onoff'
         """
         params = self.coordinator.params
         attrs: dict[str, Any] = {
@@ -229,23 +235,84 @@ class TrainingVisualizationSensor(CoordinatorEntity[PredictiveHeatingCoordinator
             "last_trained": (
                 params.last_trained.isoformat() if params.last_trained else None
             ),
+            # Phase 1 metadata
+            "training_mode": params.training_mode,
+            "q_heating_source": params.q_heating_source,
+            "t_outdoor_avg": (
+                round(params.t_outdoor_avg_training, 2)
+                if params.t_outdoor_avg_training is not None else None
+            ),
         }
 
         # Residuals: measured vs predicted over time
         # Store only arrays (not full dicts) to stay under 16KB HA limit
         residuals = self.coordinator.last_training_residuals
         if residuals:
-            # Extract arrays for ApexCharts — this is more efficient than storing full dicts
             attrs["residuals_timestamps"] = [r["ts"] for r in residuals]
             attrs["residuals_measured"] = [r["measured"] for r in residuals]
             attrs["residuals_predicted"] = [r["predicted"] for r in residuals]
             attrs["residuals_errors"] = [r["error"] for r in residuals]
-            # RMSE summary
             errors = [r["error"] for r in residuals]
             rmse = (sum(e ** 2 for e in errors) / len(errors)) ** 0.5
             attrs["rmse_k"] = round(rmse, 3)
 
         return attrs
+
+
+class TrainingInputSensor(CoordinatorEntity[PredictiveHeatingCoordinator], SensorEntity):
+    """Exposes the raw training data (temperatures + heating) used to fit the model.
+
+    This is the 'input side' of training: what did the model actually see?
+    Use this to verify that the heater on/off pattern (or gas readings) look correct
+    and that outdoor temp is moving as expected.
+
+    Attributes:
+      timestamps:    ISO timestamps of sampled training points
+      t_indoor:      Indoor temperature at each sample (°C)
+      t_outdoor:     Outdoor temperature at each sample (°C)
+      q_heating_w:   Heat input at each sample (W)
+      q_heating_source: 'gas' or 'heater_onoff'
+      n_points:      Total training points (before sampling)
+      coverage_pct:  Data coverage percentage
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Training Inputs"
+    _attr_icon = "mdi:database-eye"
+
+    def __init__(
+        self, coordinator: PredictiveHeatingCoordinator, entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_training_inputs"
+        self._attr_device_info = _device_info(entry)
+
+    @property
+    def native_value(self) -> str:
+        """Summary of what training data was collected."""
+        inputs = self.coordinator.last_training_inputs
+        if not inputs:
+            return "No training data collected yet"
+        n = inputs.get("n_points", 0)
+        cov = inputs.get("coverage_pct", 0.0)
+        src = inputs.get("q_heating_source", "unknown")
+        return f"{n} points, {cov:.0f}% coverage, Q from {src}"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Sampled training arrays for dashboard visualization."""
+        inputs = self.coordinator.last_training_inputs
+        if not inputs:
+            return None
+        return {
+            "timestamps": inputs.get("timestamps", []),
+            "t_indoor": inputs.get("t_indoor", []),
+            "t_outdoor": inputs.get("t_outdoor", []),
+            "q_heating_w": inputs.get("q_heating_w", []),
+            "q_heating_source": inputs.get("q_heating_source", "unknown"),
+            "n_points": inputs.get("n_points", 0),
+            "coverage_pct": inputs.get("coverage_pct", 0.0),
+        }
 
 
 class PredictionHorizonSensor(CoordinatorEntity[PredictiveHeatingCoordinator], SensorEntity):
