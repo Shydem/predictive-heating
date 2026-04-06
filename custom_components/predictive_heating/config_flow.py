@@ -78,7 +78,7 @@ class PredictiveHeatingConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             for key in (CONF_INDOOR_TEMP_ENTITY, CONF_OUTDOOR_TEMP_ENTITY, CONF_ELECTRICITY_PRICE_ENTITY):
                 if user_input.get(key) and self.hass.states.get(user_input[key]) is None:
                     errors[key] = "entity_not_found"
-            for key in (CONF_WEATHER_ENTITY,):
+            for key in (CONF_WEATHER_ENTITY, CONF_GAS_CONSUMPTION_ENTITY):
                 if user_input.get(key) and self.hass.states.get(user_input[key]) is None:
                     errors[key] = "entity_not_found"
             if not errors:
