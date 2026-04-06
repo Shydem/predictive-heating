@@ -34,6 +34,7 @@ from .const import (
     CONF_OUTDOOR_TEMP_ENTITY,
     DEFAULT_GAS_EFFICIENCY,
     FALLBACK_INTERNAL_GAIN_W,
+    FALLBACK_OUTDOOR_TEMP,
     GAS_KWH_PER_M3,
 )
 from .trace import Trace
@@ -172,7 +173,7 @@ async def collect_training_data(
         return str(value) if value else ""
 
     indoor_entity = _normalize_entity_id(config[CONF_INDOOR_TEMP_ENTITY])
-    outdoor_entity = _normalize_entity_id(config[CONF_OUTDOOR_TEMP_ENTITY])
+    outdoor_entity = _normalize_entity_id(config.get(CONF_OUTDOOR_TEMP_ENTITY, ""))
     internal_gain_w = config.get(CONF_INTERNAL_GAIN_W, FALLBACK_INTERNAL_GAIN_W)
 
     # Phase 1: optional gas consumption entity
@@ -255,8 +256,15 @@ async def collect_training_data(
 
     if not indoor_series:
         trace.error("no_indoor_data", f"No valid data from indoor sensor {indoor_entity}")
-    if not outdoor_series:
-        trace.error("no_outdoor_data", f"No valid data from outdoor sensor {outdoor_entity}")
+
+    if not outdoor_entity:
+        trace.step("no_outdoor_entity",
+            result={"fallback": FALLBACK_OUTDOOR_TEMP},
+            note=f"No outdoor sensor configured — using {FALLBACK_OUTDOOR_TEMP}°C constant. "
+                 "Add an outdoor sensor in Settings → Integrations → Predictive Heating for better accuracy.")
+    elif not outdoor_series:
+        trace.warn("no_outdoor_data",
+            f"No valid data from outdoor sensor {outdoor_entity} — using {FALLBACK_OUTDOOR_TEMP}°C fallback.")
 
     # Gas series: cumulative m³ counter (most common: DSMR/P1 integration)
     gas_series: list[tuple[datetime, float]] = []
@@ -295,9 +303,12 @@ async def collect_training_data(
         t_start = grid_times[i]
 
         t_in = _interpolate_temp(indoor_series, t_start)
-        t_out = _interpolate_temp(outdoor_series, t_start)
+        # Outdoor: use sensor data if available, else fallback constant
+        t_out = _interpolate_temp(outdoor_series, t_start) if outdoor_series else None
+        if t_out is None:
+            t_out = FALLBACK_OUTDOOR_TEMP
 
-        if t_in is None or t_out is None:
+        if t_in is None:
             data.quality.gaps.append(t_start.isoformat())
             continue
 

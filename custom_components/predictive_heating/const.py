@@ -112,8 +112,9 @@ GAS_KWH_PER_M3: Final = 9.77
 
 # ─── Training tuning ─────────────────────────────────────────────────────────
 
-TRAINING_MIN_POINTS: Final = 20
-"""Minimum data points to attempt training. 20 × 15min = 5 hours."""
+TRAINING_MIN_POINTS: Final = 10
+"""Minimum data points to attempt training. 10 × 15min = 2.5 hours.
+Linear regression works on very few points — even 10 gives a usable result."""
 
 TRAINING_UA_BOUNDS: Final = (10.0, 2000.0)
 """W/K range. 10 = passive house. 2000 = a tent."""
@@ -121,9 +122,11 @@ TRAINING_UA_BOUNDS: Final = (10.0, 2000.0)
 TRAINING_C_BOUNDS: Final = (1.0, 200.0)
 """kWh/K range. 1 = caravan. 200 = massive concrete building."""
 
-TRAINING_MAX_ITER: Final = 5000
 TRAINING_INITIAL_UA: Final = 150.0
+"""Fallback UA if training degenerates. Reasonable for a medium Dutch house."""
+
 TRAINING_INITIAL_C: Final = 10.0
+"""Fallback thermal mass if training degenerates. Medium house with brick walls."""
 
 # Max residual points to store for visualization (covers ~2 days at 15min)
 TRAINING_MAX_RESIDUAL_POINTS: Final = 200
