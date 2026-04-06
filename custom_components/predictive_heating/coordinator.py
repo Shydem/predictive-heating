@@ -24,6 +24,7 @@ from .const import (
     CONF_GAS_PRICE,
     CONF_HEATING_DEVICES,
     CONF_INDOOR_TEMP_ENTITY,
+    CONF_INTERNAL_GAIN_W,
     CONF_OPTIMIZATION_TIMESTEP_MIN,
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_PREDICTION_HORIZON_HOURS,
@@ -31,6 +32,7 @@ from .const import (
     CONF_TRAINING_INTERVAL_DAYS,
     CONF_TRAINING_WINDOW_DAYS,
     CONF_WEATHER_ENTITY,
+    CONF_DEVICE_COP_DATA,
     CONF_DEVICE_ENTITY,
     CONF_DEVICE_MAX_OUTPUT_W,
     CONF_DEVICE_NAME,
@@ -38,6 +40,7 @@ from .const import (
     CONF_DEVICE_TYPE,
     DEFAULT_COP_A,
     DEFAULT_COP_B,
+    DEFAULT_COP_DATA_AIR_SOURCE,
     DEFAULT_GAS_EFFICIENCY,
     DEFAULT_GAS_PRICE,
     DEFAULT_OPTIMIZATION_TIMESTEP_MIN,
@@ -49,6 +52,7 @@ from .const import (
     FALLBACK_ELEC_PRICE,
     FALLBACK_INTERNAL_GAIN_W,
     FALLBACK_OUTDOOR_TEMP,
+    SOURCE_ELECTRIC,
 )
 from .data_collector import collect_training_data
 from .model import HeatingDevice, SlotInput, ThermalParams, train_model
@@ -95,16 +99,31 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _build_devices(self) -> list[HeatingDevice]:
         """Build HeatingDevice list from config."""
-        return [
-            HeatingDevice(
+        devices = []
+        for d in self.config.get(CONF_HEATING_DEVICES, []):
+            cop_data = d.get(CONF_DEVICE_COP_DATA, [])
+            # Parse COP data: stored as list of [temp, cop] pairs
+            cop_points = []
+            if isinstance(cop_data, list):
+                for item in cop_data:
+                    if isinstance(item, (list, tuple)) and len(item) == 2:
+                        try:
+                            cop_points.append((float(item[0]), float(item[1])))
+                        except (ValueError, TypeError):
+                            pass
+            # Default COP curve for electric devices without explicit data
+            if d[CONF_DEVICE_SOURCE] == SOURCE_ELECTRIC and not cop_points:
+                cop_points = list(DEFAULT_COP_DATA_AIR_SOURCE)
+
+            devices.append(HeatingDevice(
                 name=d[CONF_DEVICE_NAME],
                 entity_id=d[CONF_DEVICE_ENTITY],
                 device_type=d[CONF_DEVICE_TYPE],
                 energy_source=d[CONF_DEVICE_SOURCE],
                 max_output_w=d[CONF_DEVICE_MAX_OUTPUT_W],
-            )
-            for d in self.config.get(CONF_HEATING_DEVICES, [])
-        ]
+                cop_data_points=cop_points,
+            ))
+        return devices
 
     # ── Parameter persistence ─────────────────────────────────────────────────
 
@@ -199,43 +218,122 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ── Electricity prices ────────────────────────────────────────────────────
 
     def _get_prices(self) -> list[tuple[datetime, float]]:
-        """Read electricity prices from Nordpool or similar sensor."""
+        """Read electricity prices from multiple possible integrations.
+
+        Supports (in detection order):
+        1. Custom Nordpool HACS: raw_today/raw_tomorrow attributes
+           [{start, end, value}, ...]
+        2. ENTSO-e HACS: prices/prices_today/prices_tomorrow attributes
+           [{time, price}, ...]
+        3. Any sensor with today/tomorrow plain list attributes
+        4. Fallback: current sensor state as flat rate for 48h
+        """
         entity_id = self.config.get(CONF_ELECTRICITY_PRICE_ENTITY, "")
         state = self.hass.states.get(entity_id) if entity_id else None
         if state is None:
             return []
 
-        prices = []
+        prices: list[tuple[datetime, float]] = []
         attrs = state.attributes
         now = dt_util.now()
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # Try Nordpool raw format first, then plain list
-        for day_offset, keys in [(0, ("raw_today", "today")), (1, ("raw_tomorrow", "tomorrow"))]:
-            base = today + timedelta(days=day_offset)
-            for key in keys:
-                data = attrs.get(key)
-                if not isinstance(data, list):
-                    continue
-                for i, item in enumerate(data):
-                    if isinstance(item, dict):
-                        ts = item.get("start", base + timedelta(hours=i))
-                        if isinstance(ts, str):
-                            ts = datetime.fromisoformat(ts)
-                        prices.append((ts, float(item.get("value", 0.0))))
-                    else:
-                        prices.append((base + timedelta(hours=i), float(item)))
-                break  # found data for this day
+        # ── Strategy 1: Custom Nordpool HACS (raw_today / raw_tomorrow) ───
+        raw_today = attrs.get("raw_today")
+        raw_tomorrow = attrs.get("raw_tomorrow")
+        if isinstance(raw_today, list) and raw_today:
+            prices.extend(self._parse_raw_price_list(raw_today))
+            tomorrow_valid = attrs.get("tomorrow_valid", False)
+            if tomorrow_valid and isinstance(raw_tomorrow, list):
+                prices.extend(self._parse_raw_price_list(raw_tomorrow))
+            if prices:
+                _LOGGER.debug(
+                    "Loaded %d prices via custom Nordpool (raw_today/raw_tomorrow)",
+                    len(prices),
+                )
+                return sorted(prices, key=lambda x: x[0])
 
-        # Fallback: use current price as flat rate
-        if not prices:
-            try:
-                p = float(state.state)
-                prices = [(now + timedelta(hours=h), p) for h in range(48)]
-            except (ValueError, TypeError):
-                pass
+        # ── Strategy 2: ENTSO-e HACS (prices attribute) ──────────────────
+        entsoe_prices = attrs.get("prices")
+        if isinstance(entsoe_prices, list) and entsoe_prices:
+            prices.extend(self._parse_raw_price_list(entsoe_prices))
+            if prices:
+                _LOGGER.debug(
+                    "Loaded %d prices via ENTSO-e (prices attr)", len(prices),
+                )
+                return sorted(prices, key=lambda x: x[0])
+
+        # Also try prices_today + prices_tomorrow variant
+        for key in ("prices_today", "prices_tomorrow"):
+            plist = attrs.get(key)
+            if isinstance(plist, list):
+                prices.extend(self._parse_raw_price_list(plist))
+        if prices:
+            _LOGGER.debug(
+                "Loaded %d prices via ENTSO-e (today/tomorrow)", len(prices),
+            )
+            return sorted(prices, key=lambda x: x[0])
+
+        # ── Strategy 3: Plain list attributes (today / tomorrow) ──────────
+        for day_offset, key in [(0, "today"), (1, "tomorrow")]:
+            data = attrs.get(key)
+            if isinstance(data, list):
+                base = today + timedelta(days=day_offset)
+                for i, val in enumerate(data):
+                    if val is not None:
+                        try:
+                            prices.append((base + timedelta(hours=i), float(val)))
+                        except (ValueError, TypeError):
+                            pass
+        if prices:
+            _LOGGER.debug("Loaded %d prices from plain list attrs", len(prices))
+            return sorted(prices, key=lambda x: x[0])
+
+        # ── Strategy 4: Flat rate fallback from current state ─────────────
+        try:
+            p = float(state.state)
+            prices = [(now + timedelta(hours=h), p) for h in range(48)]
+            _LOGGER.debug("Using flat rate fallback: %.4f/kWh", p)
+        except (ValueError, TypeError):
+            pass
 
         return sorted(prices, key=lambda x: x[0])
+
+    @staticmethod
+    def _parse_raw_price_list(
+        price_list: list,
+    ) -> list[tuple[datetime, float]]:
+        """Parse price entries from various integration formats.
+
+        Handles:
+        - Custom Nordpool: {start: datetime|str, end: ..., value: float}
+        - ENTSO-e:         {time: str, price: float}
+        - Mixed:           {start: ..., price: ...} or {time: ..., value: ...}
+        """
+        prices = []
+        for item in price_list:
+            if not isinstance(item, dict):
+                continue
+            # Find timestamp: try 'start', then 'time', then 'datetime'
+            ts = item.get("start") or item.get("time") or item.get("datetime")
+            if ts is None:
+                continue
+            if isinstance(ts, str):
+                try:
+                    ts = datetime.fromisoformat(ts)
+                except (ValueError, TypeError):
+                    continue
+            # Find price: try 'value', then 'price'
+            val = item.get("value")
+            if val is None:
+                val = item.get("price")
+            if val is None:
+                continue
+            try:
+                prices.append((ts, float(val)))
+            except (ValueError, TypeError):
+                pass
+        return prices
 
     def _price_at(self, prices: list[tuple[datetime, float]], t: datetime) -> float:
         """Interpolate price at time t."""
@@ -421,7 +519,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 electricity_price=self._price_at(prices, slot_time),
                 gas_price=gas_price,
                 solar_gain_w=solar_w,
-                internal_gain_w=FALLBACK_INTERNAL_GAIN_W,
+                internal_gain_w=self.config.get(CONF_INTERNAL_GAIN_W, FALLBACK_INTERNAL_GAIN_W),
             ))
 
         # Run optimizer

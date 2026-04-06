@@ -22,6 +22,7 @@ from .const import (
     CONF_HEATING_HOT_WATER_FRACTION,
     CONF_HEATPUMP_ELECTRICITY_ENTITY,
     CONF_INDOOR_TEMP_ENTITY,
+    CONF_INTERNAL_GAIN_W,
     CONF_OUTDOOR_ELECTRIC_LOADS_W,
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_TOTAL_ELECTRICITY_ENTITY,
@@ -134,9 +135,13 @@ async def collect_training_data(
     entity_map = {
         "indoor": config[CONF_INDOOR_TEMP_ENTITY],
         "outdoor": config[CONF_OUTDOOR_TEMP_ENTITY],
-        "gas": config[CONF_GAS_CONSUMPTION_ENTITY],
-        "elec_total": config[CONF_TOTAL_ELECTRICITY_ENTITY],
     }
+    gas_entity = config.get(CONF_GAS_CONSUMPTION_ENTITY, "")
+    if gas_entity:
+        entity_map["gas"] = gas_entity
+    elec_entity = config.get(CONF_TOTAL_ELECTRICITY_ENTITY, "")
+    if elec_entity:
+        entity_map["elec_total"] = elec_entity
     hp_entity = config.get(CONF_HEATPUMP_ELECTRICITY_ENTITY, "")
     if hp_entity:
         entity_map["hp_elec"] = hp_entity
@@ -194,6 +199,7 @@ async def collect_training_data(
     gas_eff = config.get(CONF_GAS_EFFICIENCY, DEFAULT_GAS_EFFICIENCY)
     cop_coeffs = config.get(CONF_COP_COEFFICIENTS, [DEFAULT_COP_A, DEFAULT_COP_B])
     outdoor_loads_w = config.get(CONF_OUTDOOR_ELECTRIC_LOADS_W, DEFAULT_OUTDOOR_ELECTRIC_LOADS_W)
+    configured_internal_gain_w = config.get(CONF_INTERNAL_GAIN_W, FALLBACK_INTERNAL_GAIN_W)
 
     # Resample and compute derived quantities
     data = TrainingData()
@@ -242,7 +248,7 @@ async def collect_training_data(
             indoor_kwh = max(0.0, total_kwh - (hp_kwh if has_hp_data else 0.0) - outdoor_kwh)
             internal_w = (indoor_kwh * INDOOR_ELEC_HEAT_FRACTION * J_PER_KWH) / dt_s
         else:
-            internal_w = FALLBACK_INTERNAL_GAIN_W
+            internal_w = configured_internal_gain_w
 
         data.timestamps.append(t_start)
         data.t_indoor.append(t_in)

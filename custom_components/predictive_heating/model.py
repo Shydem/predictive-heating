@@ -80,6 +80,8 @@ class HeatingDevice:
     device_type: str  # "on_off" or "stepless"
     energy_source: str  # "gas" or "electric"
     max_output_w: float
+    cop_data_points: list[tuple[float, float]] = field(default_factory=list)
+    """COP curve as (outdoor_temp, COP) pairs. Only used for electric devices."""
 
 
 @dataclass
@@ -161,11 +163,57 @@ def euler_step(
 
 
 def compute_cop(t_outdoor: float, cop_a: float, cop_b: float) -> float:
-    """Heat pump COP at given outdoor temperature.
+    """Heat pump COP at given outdoor temperature (legacy linear model).
 
     COP = cop_a + cop_b × T_outdoor, floored at 1.0.
     """
     return max(1.0, cop_a + cop_b * t_outdoor)
+
+
+def interpolate_cop(
+    data_points: list[tuple[float, float]], t_outdoor: float
+) -> float:
+    """Heat pump COP by piecewise linear interpolation of manufacturer data.
+
+    data_points: sorted list of (outdoor_temp_°C, COP) tuples from spec sheet.
+    Clamps to the nearest value outside the data range.
+    Returns at least 1.0.
+    """
+    if not data_points:
+        return 3.0  # safe default if somehow empty
+
+    pts = sorted(data_points, key=lambda p: p[0])
+
+    # Below lowest data point — clamp
+    if t_outdoor <= pts[0][0]:
+        return max(1.0, pts[0][1])
+
+    # Above highest data point — clamp
+    if t_outdoor >= pts[-1][0]:
+        return max(1.0, pts[-1][1])
+
+    # Interpolate between bracketing points
+    for i in range(1, len(pts)):
+        if pts[i][0] >= t_outdoor:
+            t0, cop0 = pts[i - 1]
+            t1, cop1 = pts[i]
+            span = t1 - t0
+            if span <= 0:
+                return max(1.0, cop0)
+            frac = (t_outdoor - t0) / span
+            return max(1.0, cop0 + frac * (cop1 - cop0))
+
+    return max(1.0, pts[-1][1])
+
+
+def device_cop(
+    device: HeatingDevice, t_outdoor: float,
+    cop_a: float = 2.8, cop_b: float = 0.05,
+) -> float:
+    """Get COP for a device: use its data points if available, else legacy linear."""
+    if device.cop_data_points:
+        return interpolate_cop(device.cop_data_points, t_outdoor)
+    return compute_cop(t_outdoor, cop_a, cop_b)
 
 
 def heat_cost_per_wh(

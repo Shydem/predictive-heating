@@ -24,6 +24,7 @@ CONF_HEATING_HOT_WATER_FRACTION: Final = "heating_hot_water_fraction"
 CONF_GAS_EFFICIENCY: Final = "gas_efficiency"
 CONF_COP_COEFFICIENTS: Final = "cop_coefficients"
 CONF_OUTDOOR_ELECTRIC_LOADS_W: Final = "outdoor_electric_loads_w"
+CONF_INTERNAL_GAIN_W: Final = "internal_gain_w"
 CONF_TRAINING_INTERVAL_DAYS: Final = "training_interval_days"
 CONF_TRAINING_WINDOW_DAYS: Final = "training_window_days"
 CONF_PREDICTION_HORIZON_HOURS: Final = "prediction_horizon_hours"
@@ -56,6 +57,7 @@ CONF_DEVICE_ENTITY: Final = "entity_id"
 CONF_DEVICE_TYPE: Final = "device_type"
 CONF_DEVICE_SOURCE: Final = "energy_source"
 CONF_DEVICE_MAX_OUTPUT_W: Final = "max_output_w"
+CONF_DEVICE_COP_DATA: Final = "cop_data_points"
 
 DEVICE_TYPE_ON_OFF: Final = "on_off"
 DEVICE_TYPE_STEPLESS: Final = "stepless"
@@ -72,7 +74,21 @@ DEFAULT_GAS_EFFICIENCY: Final = 0.90
 
 DEFAULT_COP_A: Final = 2.8
 DEFAULT_COP_B: Final = 0.05
-"""COP = A + B * T_outdoor. At 7°C → 3.15, at -5°C → 2.55. COP drops in cold weather."""
+"""Legacy linear COP model. Kept for backward compatibility."""
+
+# Manufacturer-style COP data points: list of (outdoor_temp_°C, COP) tuples.
+# Users enter these from their heat pump's spec sheet.
+# Linear interpolation between points; clamped at extremes.
+
+DEFAULT_COP_DATA_AIR_SOURCE: Final = [
+    (-15, 2.0), (-7, 2.5), (2, 3.2), (7, 4.0), (12, 4.8),
+]
+"""Typical air-source heat pump (Daikin Altherma, Vaillant aroTHERM, etc.)."""
+
+DEFAULT_COP_DATA_GROUND_SOURCE: Final = [
+    (-5, 3.5), (0, 4.0), (5, 4.5), (10, 5.0),
+]
+"""Typical ground-source heat pump (brine-to-water). More stable COP."""
 
 DEFAULT_OUTDOOR_ELECTRIC_LOADS_W: Final = 0.0
 DEFAULT_GAS_PRICE: Final = 1.0

@@ -26,6 +26,7 @@ from .model import (
     ThermalParams,
     compute_cop,
     compute_heat_deficit_wh,
+    device_cop,
     euler_step,
     heat_cost_per_wh,
 )
@@ -159,10 +160,10 @@ def _optimize_one_slot(
 
     total_need_wh = deficit_wh + preheat_extra_wh
 
-    # Step 4: Rank devices by cost
-    cop = compute_cop(slot.t_outdoor, cop_a, cop_b)
+    # Step 4: Rank devices by cost (COP computed per device)
     ranked = _rank_devices_by_cost(
-        devices, slot.electricity_price, slot.gas_price, cop, gas_efficiency,
+        devices, slot.electricity_price, slot.gas_price,
+        slot.t_outdoor, cop_a, cop_b, gas_efficiency,
     )
 
     # Step 5: Allocate heating
@@ -229,15 +230,21 @@ def _rank_devices_by_cost(
     devices: list[HeatingDevice],
     elec_price: float,
     gas_price: float,
-    cop: float,
+    t_outdoor: float,
+    cop_a: float,
+    cop_b: float,
     gas_efficiency: float,
 ) -> list[tuple[HeatingDevice, float]]:
     """Rank devices by cost per Wh of heat delivered, cheapest first.
+
+    COP is computed per device from its own data points (or the legacy
+    linear model as fallback).
 
     Returns list of (device, cost_per_wh) tuples.
     """
     ranked = []
     for dev in devices:
+        cop = device_cop(dev, t_outdoor, cop_a, cop_b)
         cost = heat_cost_per_wh(
             dev.energy_source, elec_price, gas_price, cop, gas_efficiency,
         )

@@ -3,20 +3,20 @@
     "step": {
       "user": {
         "title": "Sensor Entities",
-        "description": "Select the Home Assistant entities that provide your energy and temperature data.",
+        "description": "Select the entities that provide your energy and temperature data. Only indoor/outdoor temperature and electricity price are required.",
         "data": {
           "indoor_temp_entity": "Indoor temperature sensor",
           "outdoor_temp_entity": "Outdoor temperature sensor",
-          "gas_consumption_entity": "Gas consumption sensor (cumulative m³ or kWh)",
-          "total_electricity_entity": "Total electricity consumption sensor (cumulative kWh)",
-          "heatpump_electricity_entity": "Heat pump electricity sensor (optional, cumulative kWh)",
-          "electricity_price_entity": "Electricity price sensor (e.g. Nordpool)",
+          "gas_consumption_entity": "Gas consumption sensor (optional)",
+          "total_electricity_entity": "Total electricity consumption sensor (optional)",
+          "heatpump_electricity_entity": "Heat pump electricity sensor (optional)",
+          "electricity_price_entity": "Electricity price sensor (Nordpool, ENTSO-e, or similar)",
           "weather_entity": "Weather entity for forecast (optional)"
         }
       },
       "house_profile": {
         "title": "House Profile",
-        "description": "Describe your house so the model can start with reasonable estimates. These values are refined automatically once enough sensor data is available (1-2 weeks).",
+        "description": "Describe your house so the model can start with reasonable estimates. These are refined automatically once enough data is available.",
         "data": {
           "house_floor_area_m2": "Heated floor area",
           "house_type": "House type",
@@ -26,13 +26,13 @@
       },
       "parameters": {
         "title": "Model Parameters",
-        "description": "Configure the thermal model and optimization parameters.",
+        "description": "Only fields relevant to your setup are shown.",
         "data": {
-          "heating_hot_water_fraction": "Fraction of gas used for space heating (vs. hot water)",
+          "heating_hot_water_fraction": "Fraction of gas for space heating (vs. hot water)",
           "gas_efficiency": "Gas boiler efficiency",
-          "cop_coefficients_str": "Heat pump COP coefficients (a,b where COP = a + b×T_outdoor)",
-          "outdoor_electric_loads_w": "Outdoor electrical loads to subtract (EV chargers, etc.)",
           "gas_price": "Gas price",
+          "outdoor_electric_loads_w": "Outdoor electrical loads to subtract (W)",
+          "internal_gain_w": "Background heat from appliances/people (W)",
           "training_interval_days": "Retrain model every N days",
           "training_window_days": "Use N days of history for training",
           "prediction_horizon_hours": "Optimize N hours ahead",
@@ -43,11 +43,12 @@
         "title": "Heating Devices",
         "description": "Add your heating devices ({device_count} added so far).",
         "data": {
-          "name": "Device name (e.g. 'Gas Boiler', 'Heat Pump')",
+          "name": "Device name (e.g. 'Heat Pump', 'Gas Boiler')",
           "entity_id": "Device entity (climate/switch/number)",
           "device_type": "Control type",
           "energy_source": "Energy source",
-          "max_output_w": "Maximum heat output",
+          "max_output_w": "Maximum heat output (W)",
+          "cop_data_str": "COP data: outdoor_temp:COP pairs (electric only, e.g. -7:2.5, 2:3.2, 7:4.0)",
           "add_another": "Add another device?"
         }
       }
@@ -63,7 +64,6 @@
         "data": {
           "heating_hot_water_fraction": "Gas heating fraction (vs. hot water)",
           "gas_efficiency": "Gas boiler efficiency",
-          "cop_coefficients_str": "COP coefficients (a,b)",
           "gas_price": "Gas price (€/m³)",
           "outdoor_electric_loads_w": "Outdoor electric loads (W)",
           "training_interval_days": "Training interval (days)",
