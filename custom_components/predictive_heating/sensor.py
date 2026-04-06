@@ -143,9 +143,13 @@ class ModelSensor(CoordinatorEntity[PredictiveHeatingCoordinator], SensorEntity)
             return None
         value = self.coordinator.data.get(self.entity_description.key)
         if self.entity_description.key == "next_training" and isinstance(value, str):
-            from datetime import datetime
+            from datetime import datetime, timezone
             try:
-                return datetime.fromisoformat(value)
+                dt = datetime.fromisoformat(value)
+                # Ensure timezone-aware for HA TIMESTAMP sensor
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
             except (ValueError, TypeError):
                 return None
         return value
@@ -228,10 +232,10 @@ class TrainingVisualizationSensor(CoordinatorEntity[PredictiveHeatingCoordinator
         }
 
         # Residuals: measured vs predicted over time
+        # Store only arrays (not full dicts) to stay under 16KB HA limit
         residuals = self.coordinator.last_training_residuals
         if residuals:
-            attrs["residuals"] = residuals
-            # Pre-extract arrays for simpler ApexCharts config
+            # Extract arrays for ApexCharts — this is more efficient than storing full dicts
             attrs["residuals_timestamps"] = [r["ts"] for r in residuals]
             attrs["residuals_measured"] = [r["measured"] for r in residuals]
             attrs["residuals_predicted"] = [r["predicted"] for r in residuals]

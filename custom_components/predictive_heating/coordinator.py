@@ -435,14 +435,17 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Check if training is due
         interval = self.config.get(CONF_TRAINING_INTERVAL_DAYS, DEFAULT_TRAINING_INTERVAL_DAYS)
-        if self.params.last_trained is None or (
-            now - self.params.last_trained > timedelta(days=interval)
-        ):
+        last_trained = self.params.last_trained
+        # Ensure timezone-aware for comparison with now (which is always aware from dt_util)
+        if last_trained is not None and last_trained.tzinfo is None:
+            last_trained = last_trained.replace(tzinfo=timezone.utc)
+
+        if last_trained is None or (now - last_trained > timedelta(days=interval)):
             await self.async_train_model()
 
         next_training = (
-            self.params.last_trained + timedelta(days=interval)
-            if self.params.last_trained else now + timedelta(hours=1)
+            (last_trained or self.params.last_trained) + timedelta(days=interval)
+            if last_trained else now + timedelta(hours=1)
         )
 
         # Read current temperatures
