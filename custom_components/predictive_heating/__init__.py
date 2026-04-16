@@ -17,16 +17,25 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, PLATFORMS
+from .frontend_panel import async_register_frontend
 from .thermal_model import ThermalModel
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS_LIST = [Platform.CLIMATE, Platform.SENSOR]
 
+_PANEL_REGISTERED = False
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Predictive Heating from a config entry."""
     hass.data.setdefault(DOMAIN, {})
+
+    # Register the dashboard panel (once, on first entry setup)
+    global _PANEL_REGISTERED
+    if not _PANEL_REGISTERED:
+        await async_register_frontend(hass)
+        _PANEL_REGISTERED = True
 
     # Load or create thermal model for this room
     model = await _load_model(hass, entry.entry_id)

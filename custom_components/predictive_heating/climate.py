@@ -47,6 +47,7 @@ from .const import (
     UPDATE_INTERVAL,
 )
 from .controller import HeatingAction, HeatingController, PresetMode
+from .solar import estimate_solar_irradiance
 from .thermal_model import ThermalModel, ThermalObservation
 
 _LOGGER = logging.getLogger(__name__)
@@ -254,12 +255,16 @@ class PredictiveHeatingClimate(ClimateEntity):
 
         outdoor = self._outdoor_temp if self._outdoor_temp is not None else 10.0
 
-        # Feed observation to thermal model
+        # Estimate solar irradiance from sun position + weather
+        solar = estimate_solar_irradiance(self.hass)
+
+        # Feed observation to thermal model (EKF learns from this)
         obs = ThermalObservation(
             timestamp=time.time(),
             t_indoor=self._current_temp,
             t_outdoor=outdoor,
             heating_on=self._hvac_action == HVACAction.HEATING,
+            solar_irradiance=solar,
         )
         self._model.add_observation(obs)
 
@@ -336,12 +341,26 @@ class PredictiveHeatingClimate(ClimateEntity):
         attrs = {
             "thermal_model_state": self._model.state,
             "heat_loss_coefficient": round(self._model.params.heat_loss_coeff, 1),
-            "thermal_mass": round(self._model.params.thermal_mass, 0),
+            "thermal_mass_kj": round(self._model.params.thermal_mass, 0),
+            "heating_power": round(self._model.params.heating_power, 0),
+            "solar_gain_factor": round(self._model.params.solar_gain_factor, 3),
             "idle_samples": self._model.idle_count,
             "active_samples": self._model.active_count,
+            "total_updates": self._model.total_updates,
+            "mean_prediction_error": (
+                round(self._model.mean_prediction_error, 3)
+                if self._model.mean_prediction_error != float("inf")
+                else None
+            ),
         }
         if self._outdoor_temp is not None:
             attrs["outdoor_temperature"] = self._outdoor_temp
+
+        # Current solar irradiance
+        solar = estimate_solar_irradiance(self.hass)
+        if solar > 0:
+            attrs["solar_irradiance"] = round(solar, 1)
+
         return attrs
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:

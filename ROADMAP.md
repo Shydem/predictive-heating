@@ -49,7 +49,7 @@ What's built:
 
 ---
 
-## Phase 2 — Self-Learning Thermal Model (v0.2)
+## Phase 2 — Self-Learning Thermal Model (v0.2) ✅ COMPLETE
 
 **Goal:** The model accurately predicts how each room heats and cools.
 
@@ -143,17 +143,28 @@ Future possibilities:
 
 ```
 custom_components/predictive_heating/
-├── __init__.py          # Integration setup, model persistence
-├── manifest.json        # HACS metadata
+├── __init__.py          # Integration setup, model persistence, panel registration
+├── manifest.json        # HACS metadata (requires numpy)
 ├── const.py             # Constants and defaults
 ├── config_flow.py       # UI configuration flow
 ├── climate.py           # Main climate entity (wraps underlying TRV)
 ├── sensor.py            # Diagnostic sensors (model state, heat loss, progress)
 ├── controller.py        # Heating controller (hysteresis now, MPC later)
-├── thermal_model.py     # Self-learning room thermal model
+├── thermal_model.py     # Self-learning room thermal model (EKF + simple fallback)
+├── ekf.py               # Extended Kalman Filter for thermal parameter estimation
+├── solar.py             # Solar irradiance estimation from sun.sun + weather
+├── frontend_panel.py    # Sidebar panel registration + WebSocket API
+├── frontend/
+│   └── entrypoint.js    # Dashboard UI (room cards, charts, training progress)
 ├── strings.json         # UI strings
 └── translations/
     └── en.json          # English translations
+
+tests/
+└── test_thermal_model.py  # Verification tests (EKF, predictions, serialization)
+
+hacs.json                  # HACS integration metadata
+ROADMAP.md                 # This file
 ```
 
 ---
