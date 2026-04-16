@@ -128,6 +128,19 @@ def ws_get_rooms(
         active_pct = min(100, model.active_count / MIN_ACTIVE_SAMPLES * 100)
         progress = int((idle_pct + active_pct) / 2)
 
+        # Zone info
+        zone = data.get("zone")
+        zone_info = {}
+        if zone:
+            zone_info = {
+                "zone_id": zone.zone_id,
+                "zone_rooms": zone.room_names,
+                "zone_is_heating": zone.is_heating,
+                "zone_setpoint": zone._last_setpoint,
+                "zone_flow_temp": zone._last_flow_temp,
+                "opentherm_enabled": zone.opentherm_enabled,
+            }
+
         rooms.append(
             {
                 "entry_id": entry_id,
@@ -144,6 +157,7 @@ def ws_get_rooms(
                 "min_idle": MIN_IDLE_SAMPLES,
                 "min_active": MIN_ACTIVE_SAMPLES,
                 "learning_progress": progress,
+                **zone_info,
             }
         )
 

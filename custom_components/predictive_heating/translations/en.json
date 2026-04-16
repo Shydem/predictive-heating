@@ -3,14 +3,21 @@
     "step": {
       "user": {
         "title": "Add a Room",
-        "description": "Configure Predictive Heating for a room. You need at least a temperature sensor and a climate entity (TRV or thermostat).",
+        "description": "Configure Predictive Heating for a room. Rooms sharing the same climate entity are automatically grouped into a heating zone.",
         "data": {
           "room_name": "Room Name",
           "temperature_sensor": "Room Temperature Sensor",
-          "climate_entity": "Climate Entity (TRV / Thermostat)",
+          "climate_entity": "Thermostat / Climate Entity",
           "outdoor_temperature_sensor": "Outdoor Temperature Sensor (optional)",
           "humidity_sensor": "Humidity Sensor (optional)",
-          "window_sensors": "Window/Door Sensors (optional)"
+          "window_sensors": "Window/Door Sensors (optional)",
+          "opentherm_enabled": "OpenTherm boiler modulation",
+          "opentherm_flow_temp_number": "OpenTherm flow temperature entity (number)"
+        },
+        "data_description": {
+          "climate_entity": "The thermostat that controls this room. If multiple rooms use the same thermostat, they will be grouped into a zone automatically.",
+          "opentherm_enabled": "Enable if your thermostat supports OpenTherm. This allows flow temperature modulation for better efficiency.",
+          "opentherm_flow_temp_number": "The number entity that controls the boiler flow/water temperature (from OpenTherm Gateway or similar integration)."
         }
       }
     }
@@ -18,12 +25,20 @@
   "options": {
     "step": {
       "init": {
-        "title": "Temperature Presets",
+        "title": "Temperature & Control Settings",
         "data": {
           "comfort_temp": "Comfort Temperature",
           "eco_temp": "Eco Temperature",
           "away_temp": "Away Temperature",
-          "sleep_temp": "Sleep Temperature"
+          "sleep_temp": "Sleep Temperature",
+          "max_setpoint_delta": "Maximum thermostat overshoot",
+          "min_flow_temp": "Minimum flow temperature (OpenTherm)",
+          "max_flow_temp": "Maximum flow temperature (OpenTherm)"
+        },
+        "data_description": {
+          "max_setpoint_delta": "How many degrees above target the thermostat setpoint can go. Lower = gentler heating, less overshoot. Default 2.5°C.",
+          "min_flow_temp": "Lowest boiler water temperature. Lower = higher heat pump COP but slower heating.",
+          "max_flow_temp": "Highest boiler water temperature. Used when room is far below target."
         }
       }
     }

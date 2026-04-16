@@ -217,8 +217,23 @@ class PredictiveHeatingPanel extends HTMLElement {
           </div>
         </div>
 
+        <div class="zone-info">
+          ${room.zone_rooms && room.zone_rooms.length > 1
+            ? `<span class="zone-badge">🔗 Zone: ${room.zone_rooms.join(", ")}</span>`
+            : ""
+          }
+          ${room.opentherm_enabled
+            ? `<span class="ot-badge">⚡ OT ${room.zone_flow_temp != null ? room.zone_flow_temp + "°C" : ""}</span>`
+            : ""
+          }
+          ${room.zone_setpoint != null
+            ? `<span class="setpoint-info">Setpoint: ${room.zone_setpoint}°C</span>`
+            : ""
+          }
+        </div>
+
         <div class="card-footer">
-          <span class="hvac-state ${room.hvac_action}">${room.hvac_action || "idle"}</span>
+          <span class="hvac-state ${room.zone_is_heating ? "heating" : room.hvac_action}">${room.zone_is_heating ? "heating" : (room.hvac_action || "idle")}</span>
           <span class="heat-loss">H = ${room.heat_loss_coeff.toFixed(1)} W/K</span>
         </div>
       `;
@@ -891,6 +906,30 @@ class PredictiveHeatingPanel extends HTMLElement {
         color: var(--text-secondary);
         padding-top: 12px;
         border-top: 1px solid var(--card-border);
+      }
+
+      .zone-info {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-bottom: 10px;
+        font-size: 11px;
+      }
+      .zone-badge {
+        background: rgba(10,132,255,0.1);
+        color: var(--blue);
+        padding: 2px 8px;
+        border-radius: 6px;
+      }
+      .ot-badge {
+        background: rgba(48,209,88,0.1);
+        color: var(--green);
+        padding: 2px 8px;
+        border-radius: 6px;
+      }
+      .setpoint-info {
+        color: var(--text-secondary);
+        padding: 2px 8px;
       }
 
       .hvac-state {
