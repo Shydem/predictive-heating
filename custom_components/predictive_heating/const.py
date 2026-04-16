@@ -11,8 +11,6 @@ CONF_CLIMATE_ENTITY = "climate_entity"
 CONF_WINDOW_SENSORS = "window_sensors"
 CONF_HEAT_PUMP_COP_SENSOR = "heat_pump_cop_sensor"
 CONF_HEATING_ZONE = "heating_zone"
-CONF_OPENTHERM_ENABLED = "opentherm_enabled"
-CONF_OPENTHERM_FLOW_TEMP_NUMBER = "opentherm_flow_temp_number"
 CONF_MAX_SETPOINT_DELTA = "max_setpoint_delta"
 
 # Thermal model defaults
@@ -28,11 +26,6 @@ DEFAULT_AWAY_TEMP = 15.0
 DEFAULT_SLEEP_TEMP = 18.5
 DEFAULT_HYSTERESIS = 0.3  # degrees C
 DEFAULT_MAX_SETPOINT_DELTA = 2.5  # max degrees above target to send to thermostat
-
-# OpenTherm flow temperature defaults
-DEFAULT_MIN_FLOW_TEMP = 25.0  # °C — minimum flow temperature
-DEFAULT_MAX_FLOW_TEMP = 55.0  # °C — maximum flow temperature (lower = better COP)
-DEFAULT_COMFORT_FLOW_TEMP = 40.0  # °C — comfortable middle ground
 
 # Thermal model states
 STATE_LEARNING = "learning"

@@ -222,10 +222,6 @@ class PredictiveHeatingPanel extends HTMLElement {
             ? `<span class="zone-badge">🔗 Zone: ${room.zone_rooms.join(", ")}</span>`
             : ""
           }
-          ${room.opentherm_enabled
-            ? `<span class="ot-badge">⚡ OT ${room.zone_flow_temp != null ? room.zone_flow_temp + "°C" : ""}</span>`
-            : ""
-          }
           ${room.zone_setpoint != null
             ? `<span class="setpoint-info">Setpoint: ${room.zone_setpoint}°C</span>`
             : ""
@@ -918,12 +914,6 @@ class PredictiveHeatingPanel extends HTMLElement {
       .zone-badge {
         background: rgba(10,132,255,0.1);
         color: var(--blue);
-        padding: 2px 8px;
-        border-radius: 6px;
-      }
-      .ot-badge {
-        background: rgba(48,209,88,0.1);
-        color: var(--green);
         padding: 2px 8px;
         border-radius: 6px;
       }

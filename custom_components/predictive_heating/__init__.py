@@ -9,7 +9,6 @@ Rooms sharing the same thermostat (climate entity) are automatically
 grouped into heating zones. The zone coordinator ensures:
 - Proportional setpoint control (no overshoot)
 - Correct heating state across all rooms in the zone
-- OpenTherm flow temperature modulation when available
 """
 
 from __future__ import annotations
@@ -25,8 +24,6 @@ from homeassistant.core import HomeAssistant
 from .const import (
     CONF_CLIMATE_ENTITY,
     CONF_MAX_SETPOINT_DELTA,
-    CONF_OPENTHERM_ENABLED,
-    CONF_OPENTHERM_FLOW_TEMP_NUMBER,
     CONF_ROOM_NAME,
     DEFAULT_MAX_SETPOINT_DELTA,
     DOMAIN,
@@ -63,8 +60,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register this room in its heating zone
     zone_mgr: ZoneManager = hass.data[DOMAIN]["_zone_manager"]
     climate_entity_id = entry.data.get(CONF_CLIMATE_ENTITY, "")
-    opentherm_enabled = entry.data.get(CONF_OPENTHERM_ENABLED, False)
-    opentherm_flow_entity = entry.data.get(CONF_OPENTHERM_FLOW_TEMP_NUMBER)
     max_delta = entry.options.get(
         "max_setpoint_delta",
         entry.data.get(CONF_MAX_SETPOINT_DELTA, DEFAULT_MAX_SETPOINT_DELTA),
@@ -72,8 +67,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     zone = zone_mgr.get_or_create_zone(
         climate_entity_id=climate_entity_id,
-        opentherm_enabled=opentherm_enabled,
-        opentherm_flow_temp_entity=opentherm_flow_entity,
         max_setpoint_delta=max_delta,
     )
     zone.register_room(
@@ -94,11 +87,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     _LOGGER.info(
         "Predictive Heating set up for room: %s (zone: %s, rooms in zone: %d, "
-        "OpenTherm: %s, model state: %s)",
+        "model state: %s)",
         entry.data.get(CONF_ROOM_NAME, entry.title),
         climate_entity_id,
         zone.room_count,
-        opentherm_enabled,
         model.state,
     )
 

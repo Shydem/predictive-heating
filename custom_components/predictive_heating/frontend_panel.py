@@ -82,6 +82,10 @@ def ws_get_rooms(
     rooms = []
 
     for entry_id, data in hass.data.get(DOMAIN, {}).items():
+        # Skip internal keys (e.g. _zone_manager)
+        if entry_id.startswith("_") or not isinstance(data, dict):
+            continue
+
         model = data.get("model")
         config = data.get("config", {})
         if model is None:
@@ -137,8 +141,6 @@ def ws_get_rooms(
                 "zone_rooms": zone.room_names,
                 "zone_is_heating": zone.is_heating,
                 "zone_setpoint": zone._last_setpoint,
-                "zone_flow_temp": zone._last_flow_temp,
-                "opentherm_enabled": zone.opentherm_enabled,
             }
 
         rooms.append(

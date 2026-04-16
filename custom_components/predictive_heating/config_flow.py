@@ -17,8 +17,6 @@ from .const import (
     CONF_CLIMATE_ENTITY,
     CONF_HUMIDITY_SENSOR,
     CONF_MAX_SETPOINT_DELTA,
-    CONF_OPENTHERM_ENABLED,
-    CONF_OPENTHERM_FLOW_TEMP_NUMBER,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
     CONF_ROOM_NAME,
     CONF_TEMPERATURE_SENSOR,
@@ -26,9 +24,7 @@ from .const import (
     DEFAULT_COMFORT_TEMP,
     DEFAULT_ECO_TEMP,
     DEFAULT_AWAY_TEMP,
-    DEFAULT_MAX_FLOW_TEMP,
     DEFAULT_MAX_SETPOINT_DELTA,
-    DEFAULT_MIN_FLOW_TEMP,
     DEFAULT_SLEEP_TEMP,
     DOMAIN,
 )
@@ -82,12 +78,6 @@ class PredictiveHeatingConfigFlow(
                         multiple=True,
                     )
                 ),
-                vol.Optional(
-                    CONF_OPENTHERM_ENABLED, default=False
-                ): selector.BooleanSelector(),
-                vol.Optional(CONF_OPENTHERM_FLOW_TEMP_NUMBER): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="number")
-                ),
             }
         )
 
@@ -121,7 +111,6 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
             return self.async_create_entry(title="", data=user_input)
 
         options = self.config_entry.options
-        is_opentherm = self.config_entry.data.get(CONF_OPENTHERM_ENABLED, False)
 
         schema_dict = {
             vol.Optional(
@@ -150,31 +139,6 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                 )
             ),
         }
-
-        # OpenTherm-specific options
-        if is_opentherm:
-            schema_dict[
-                vol.Optional(
-                    "min_flow_temp",
-                    default=options.get("min_flow_temp", DEFAULT_MIN_FLOW_TEMP),
-                )
-            ] = selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=20.0, max=50.0, step=1.0, unit_of_measurement="°C",
-                    mode=selector.NumberSelectorMode.SLIDER,
-                )
-            )
-            schema_dict[
-                vol.Optional(
-                    "max_flow_temp",
-                    default=options.get("max_flow_temp", DEFAULT_MAX_FLOW_TEMP),
-                )
-            ] = selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=30.0, max=80.0, step=1.0, unit_of_measurement="°C",
-                    mode=selector.NumberSelectorMode.SLIDER,
-                )
-            )
 
         return self.async_show_form(
             step_id="init",

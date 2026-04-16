@@ -8,7 +8,6 @@ Creates a virtual climate entity per room that:
 - Runs the controller to decide heating actions
 - Coordinates with other rooms in the same heating zone
 - Uses proportional setpoints to prevent overshoot
-- Supports OpenTherm flow temperature modulation
 
 Zone-aware behavior:
     When woonkamer and slaapkamer share the same thermostat, they form
@@ -46,8 +45,6 @@ from homeassistant.helpers.event import (
 
 from .const import (
     CONF_CLIMATE_ENTITY,
-    CONF_OPENTHERM_ENABLED,
-    CONF_OPENTHERM_FLOW_TEMP_NUMBER,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
     CONF_ROOM_NAME,
     CONF_TEMPERATURE_SENSOR,
@@ -127,8 +124,6 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._climate_entity_id = config[CONF_CLIMATE_ENTITY]
         self._outdoor_sensor_id = config.get(CONF_OUTDOOR_TEMPERATURE_SENSOR)
         self._window_sensor_ids = config.get(CONF_WINDOW_SENSORS, [])
-        self._opentherm_enabled = config.get(CONF_OPENTHERM_ENABLED, False)
-        self._opentherm_flow_entity = config.get(CONF_OPENTHERM_FLOW_TEMP_NUMBER)
 
         # State
         self._hvac_mode = HVACMode.HEAT
@@ -411,17 +406,6 @@ class PredictiveHeatingClimate(ClimateEntity):
                     self._async_set_underlying_temp(setpoint)
                 )
                 self._zone._last_setpoint = setpoint
-
-            # OpenTherm flow temperature control
-            if self._zone.opentherm_enabled:
-                flow_temp = self._zone.calculate_flow_temperature(
-                    t_outdoor=self._outdoor_temp
-                )
-                if flow_temp is not None:
-                    self.hass.async_create_task(
-                        self._async_set_flow_temperature(flow_temp)
-                    )
-                    self._zone._last_flow_temp = flow_temp
         else:
             # No room wants heat — tell the thermostat to idle
             # Use a setpoint just below the current temp so it stops
@@ -431,14 +415,6 @@ class PredictiveHeatingClimate(ClimateEntity):
                 self._async_set_underlying_temp(idle_setpoint)
             )
             self._zone._last_setpoint = idle_setpoint
-
-            # Lower flow temp when idling
-            if self._zone.opentherm_enabled:
-                from .const import DEFAULT_MIN_FLOW_TEMP
-                self.hass.async_create_task(
-                    self._async_set_flow_temperature(DEFAULT_MIN_FLOW_TEMP)
-                )
-                self._zone._last_flow_temp = DEFAULT_MIN_FLOW_TEMP
 
         # Update our HVAC action based on what the zone is actually doing
         self._update_hvac_action_from_zone()
@@ -453,38 +429,6 @@ class PredictiveHeatingClimate(ClimateEntity):
                 ATTR_TEMPERATURE: temperature,
             },
         )
-
-    async def _async_set_flow_temperature(self, flow_temp: float) -> None:
-        """
-        Set the OpenTherm flow/boiler temperature.
-
-        This works with the OpenTherm Gateway integration or similar
-        integrations that expose a number entity for flow temperature.
-        """
-        flow_entity = self._zone.opentherm_flow_temp_entity
-        if not flow_entity:
-            return
-
-        try:
-            await self.hass.services.async_call(
-                "number",
-                "set_value",
-                {
-                    "entity_id": flow_entity,
-                    "value": flow_temp,
-                },
-            )
-            _LOGGER.debug(
-                "Set OpenTherm flow temperature to %.1f°C via %s",
-                flow_temp,
-                flow_entity,
-            )
-        except Exception as err:
-            _LOGGER.warning(
-                "Failed to set flow temperature on %s: %s",
-                flow_entity,
-                err,
-            )
 
     # --- ClimateEntity interface ---
 
@@ -535,11 +479,6 @@ class PredictiveHeatingClimate(ClimateEntity):
 
         if self._outdoor_temp is not None:
             attrs["outdoor_temperature"] = self._outdoor_temp
-
-        # OpenTherm info
-        if self._zone.opentherm_enabled:
-            attrs["opentherm_enabled"] = True
-            attrs["flow_temperature"] = self._zone._last_flow_temp
 
         # Leading room in zone
         leader = self._zone.leading_room
