@@ -10,10 +10,15 @@
           "climate_entity": "Thermostat / Climate Entity",
           "outdoor_temperature_sensor": "Outdoor Temperature Sensor (optional)",
           "humidity_sensor": "Humidity Sensor (optional)",
-          "window_sensors": "Window/Door Sensors (optional)"
+          "window_sensors": "Window/Door Sensors (optional)",
+          "floor_area_m2": "Floor Area (m²) — optional bootstrap",
+          "ceiling_height_m": "Ceiling Height (m)",
+          "building_type": "Building Type"
         },
         "data_description": {
-          "climate_entity": "The thermostat that controls this room. If multiple rooms use the same thermostat, they will be grouped into a zone automatically."
+          "climate_entity": "The thermostat that controls this room. If multiple rooms use the same thermostat, they will be grouped into a zone automatically.",
+          "floor_area_m2": "Used once, to seed initial heat-loss and thermal-mass estimates. Leave blank to use generic defaults — the model will learn from observations regardless.",
+          "building_type": "Roughly how well-insulated this room is. Used only for the initial bootstrap; the EKF will adjust H and C as it learns."
         }
       }
     }
@@ -23,14 +28,21 @@
       "init": {
         "title": "Temperature & Control Settings",
         "data": {
+          "room_name": "Room Name",
           "comfort_temp": "Comfort Temperature",
           "eco_temp": "Eco Temperature",
           "away_temp": "Away Temperature",
           "sleep_temp": "Sleep Temperature",
-          "max_setpoint_delta": "Maximum thermostat overshoot"
+          "max_setpoint_delta": "Maximum thermostat overshoot",
+          "floor_area_m2": "Floor Area (m²)",
+          "ceiling_height_m": "Ceiling Height (m)",
+          "building_type": "Building Type"
         },
         "data_description": {
-          "max_setpoint_delta": "How many degrees above target the thermostat setpoint can go. Lower = gentler heating, less overshoot. Default 2.5°C."
+          "room_name": "Renaming a room keeps all learned thermal properties — only the displayed name changes.",
+          "max_setpoint_delta": "How many degrees above target the thermostat setpoint can go. Lower = gentler heating, less overshoot. Default 2.5°C.",
+          "floor_area_m2": "Used as an initial estimate for heat loss (H) and thermal mass (C). Only applied when the model hasn't learned anything yet.",
+          "building_type": "Insulation quality category. Only affects the initial estimate — the EKF takes over once it has observations."
         }
       }
     }

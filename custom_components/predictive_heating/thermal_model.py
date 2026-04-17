@@ -28,6 +28,9 @@ import time
 from dataclasses import dataclass, field
 
 from .const import (
+    BUILDING_TYPES,
+    DEFAULT_BUILDING_TYPE,
+    DEFAULT_CEILING_HEIGHT_M,
     DEFAULT_HEAT_LOSS_COEFFICIENT,
     DEFAULT_HEATING_POWER,
     DEFAULT_SOLAR_GAIN_FACTOR,
@@ -37,6 +40,41 @@ from .const import (
     STATE_CALIBRATED,
     STATE_LEARNING,
 )
+
+
+def estimate_initial_thermal_params(
+    floor_area_m2: float | None,
+    ceiling_height_m: float | None = None,
+    building_type: str | None = None,
+) -> dict[str, float] | None:
+    """
+    Estimate starting H (W/K) and C (kJ/K) from room dimensions + building type.
+
+    Returns ``None`` if the floor area is missing — no estimation possible.
+    Otherwise returns ``{"H": ..., "C": ..., "volume_m3": ..., "building_type": ...}``.
+
+    These are only used as a seed for the EKF when no saved model exists.
+    The EKF will correct them as observations come in.
+    """
+    if not floor_area_m2 or floor_area_m2 <= 0:
+        return None
+
+    if not ceiling_height_m or ceiling_height_m <= 0:
+        ceiling_height_m = DEFAULT_CEILING_HEIGHT_M
+
+    btype = building_type or DEFAULT_BUILDING_TYPE
+    preset = BUILDING_TYPES.get(btype) or BUILDING_TYPES[DEFAULT_BUILDING_TYPE]
+
+    volume_m3 = floor_area_m2 * ceiling_height_m
+    H = floor_area_m2 * preset["u_per_m2_floor"]  # W / K
+    C = volume_m3 * preset["vol_heat_capacity"]   # kJ / K
+
+    return {
+        "H": H,
+        "C": C,
+        "volume_m3": volume_m3,
+        "building_type": btype,
+    }
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -112,6 +150,50 @@ class ThermalModel:
                 self._ekf = ThermalEKF.from_dict(self._ekf_dict)
             else:
                 self._ekf = ThermalEKF()
+
+    def seed_from_room_dimensions(
+        self,
+        floor_area_m2: float | None,
+        ceiling_height_m: float | None = None,
+        building_type: str | None = None,
+    ) -> bool:
+        """
+        Seed the model with initial H and C estimates from room dimensions.
+
+        Only applied when the model has no prior observations (fresh room).
+        Returns True if seeding was applied.
+        """
+        if self.total_updates > 0:
+            return False  # never overwrite a trained model
+
+        est = estimate_initial_thermal_params(
+            floor_area_m2, ceiling_height_m, building_type
+        )
+        if est is None:
+            return False
+
+        H = est["H"]
+        C_kj = est["C"]
+        C_wh = C_kj / 3.6
+
+        self.params.heat_loss_coeff = H
+        self.params.thermal_mass = C_kj
+
+        if HAS_NUMPY and self._ekf is not None:
+            # Push the seed into the EKF state so it starts from a
+            # reasonable point rather than the generic defaults.
+            self._ekf.state.x[0] = H
+            self._ekf.state.x[1] = C_wh
+
+        _LOGGER.info(
+            "Seeded thermal model from dimensions: H=%.1f W/K, C=%.0f kJ/K "
+            "(floor %.1f m², height %.1f m, type %s)",
+            H, C_kj,
+            floor_area_m2 or 0.0,
+            ceiling_height_m or DEFAULT_CEILING_HEIGHT_M,
+            est["building_type"],
+        )
+        return True
 
     def add_observation(self, obs: ThermalObservation) -> None:
         """Record an observation and update model parameters."""

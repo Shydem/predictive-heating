@@ -13,6 +13,38 @@ CONF_HEAT_PUMP_COP_SENSOR = "heat_pump_cop_sensor"
 CONF_HEATING_ZONE = "heating_zone"
 CONF_MAX_SETPOINT_DELTA = "max_setpoint_delta"
 
+# Room-size / building-type bootstrap (v0.2 ROADMAP item)
+CONF_FLOOR_AREA_M2 = "floor_area_m2"
+CONF_CEILING_HEIGHT_M = "ceiling_height_m"
+CONF_BUILDING_TYPE = "building_type"
+
+DEFAULT_CEILING_HEIGHT_M = 2.6
+
+# Building-type presets used to seed the EKF with a reasonable starting point.
+# These are rough Dutch-housing-stock ballparks — the EKF will correct them
+# as observations come in. Each preset gives:
+#   u_per_m2_floor: W / (K * m² of floor area) — heat loss to outside
+#   vol_heat_capacity: kJ / (K * m³ of room volume) — thermal mass
+BUILDING_TYPES: dict[str, dict[str, float]] = {
+    "poor_insulation": {  # pre-1975, single glass, no wall insulation
+        "u_per_m2_floor": 5.0,
+        "vol_heat_capacity": 80.0,
+    },
+    "moderate_insulation": {  # 1975–2000, double glass, partial insulation
+        "u_per_m2_floor": 3.0,
+        "vol_heat_capacity": 70.0,
+    },
+    "good_insulation": {  # post-2000, HR++ glass, wall insulation
+        "u_per_m2_floor": 2.0,
+        "vol_heat_capacity": 60.0,
+    },
+    "passive_house": {  # triple glass, heavily insulated, near-passive
+        "u_per_m2_floor": 0.8,
+        "vol_heat_capacity": 50.0,
+    },
+}
+DEFAULT_BUILDING_TYPE = "moderate_insulation"
+
 # Thermal model defaults
 DEFAULT_HEAT_LOSS_COEFFICIENT = 150.0  # W/K — total heat loss per kelvin delta
 DEFAULT_THERMAL_MASS = 5000.0  # kJ/K — thermal inertia of the room

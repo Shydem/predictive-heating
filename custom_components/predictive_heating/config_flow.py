@@ -14,13 +14,19 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
 
 from .const import (
+    BUILDING_TYPES,
+    CONF_BUILDING_TYPE,
+    CONF_CEILING_HEIGHT_M,
     CONF_CLIMATE_ENTITY,
+    CONF_FLOOR_AREA_M2,
     CONF_HUMIDITY_SENSOR,
     CONF_MAX_SETPOINT_DELTA,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
     CONF_ROOM_NAME,
     CONF_TEMPERATURE_SENSOR,
     CONF_WINDOW_SENSORS,
+    DEFAULT_BUILDING_TYPE,
+    DEFAULT_CEILING_HEIGHT_M,
     DEFAULT_COMFORT_TEMP,
     DEFAULT_ECO_TEMP,
     DEFAULT_AWAY_TEMP,
@@ -28,6 +34,12 @@ from .const import (
     DEFAULT_SLEEP_TEMP,
     DOMAIN,
 )
+
+
+_BUILDING_TYPE_OPTIONS = [
+    selector.SelectOptionDict(value=key, label=key.replace("_", " ").title())
+    for key in BUILDING_TYPES
+]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +90,32 @@ class PredictiveHeatingConfigFlow(
                         multiple=True,
                     )
                 ),
+                vol.Optional(CONF_FLOOR_AREA_M2): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=2, max=500, step=0.5,
+                        unit_of_measurement="m²",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
+                vol.Optional(
+                    CONF_CEILING_HEIGHT_M,
+                    default=DEFAULT_CEILING_HEIGHT_M,
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=1.8, max=6.0, step=0.1,
+                        unit_of_measurement="m",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
+                vol.Optional(
+                    CONF_BUILDING_TYPE,
+                    default=DEFAULT_BUILDING_TYPE,
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=_BUILDING_TYPE_OPTIONS,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
             }
         )
 
@@ -106,13 +144,53 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
-        """Manage temperature presets, setpoint limits, and flow temp."""
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+        """Manage room name, temperature presets, and setpoint limits."""
+        # Fields that live on entry.data (room identity), not in options.
+        _DATA_FIELDS = (
+            CONF_ROOM_NAME,
+            CONF_FLOOR_AREA_M2,
+            CONF_CEILING_HEIGHT_M,
+            CONF_BUILDING_TYPE,
+        )
 
+        if user_input is not None:
+            current_data = dict(self.config_entry.data)
+            new_data = dict(current_data)
+            data_changed = False
+            title = self.config_entry.title
+
+            for key in _DATA_FIELDS:
+                if key not in user_input:
+                    continue
+                value = user_input[key]
+                if value != current_data.get(key):
+                    new_data[key] = value
+                    data_changed = True
+                    if key == CONF_ROOM_NAME and value:
+                        title = value
+
+            if data_changed:
+                self.hass.config_entries.async_update_entry(
+                    self.config_entry,
+                    data=new_data,
+                    title=title,
+                )
+
+            # Strip entry.data fields out of options.
+            options_to_save = {
+                k: v for k, v in user_input.items() if k not in _DATA_FIELDS
+            }
+            return self.async_create_entry(title="", data=options_to_save)
+
+        data = self.config_entry.data
         options = self.config_entry.options
+        current_name = data.get(CONF_ROOM_NAME) or self.config_entry.title
 
         schema_dict = {
+            vol.Required(
+                CONF_ROOM_NAME,
+                default=current_name,
+            ): str,
             vol.Optional(
                 "comfort_temp",
                 default=options.get("comfort_temp", DEFAULT_COMFORT_TEMP),
@@ -139,6 +217,51 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                 )
             ),
         }
+
+        # Room dimensions — keep defaults from entry.data if the user already set them.
+        floor_area_default = data.get(CONF_FLOOR_AREA_M2)
+        if floor_area_default is not None:
+            schema_dict[
+                vol.Optional(CONF_FLOOR_AREA_M2, default=floor_area_default)
+            ] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=2, max=500, step=0.5,
+                    unit_of_measurement="m²",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+        else:
+            schema_dict[vol.Optional(CONF_FLOOR_AREA_M2)] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=2, max=500, step=0.5,
+                    unit_of_measurement="m²",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+
+        schema_dict[
+            vol.Optional(
+                CONF_CEILING_HEIGHT_M,
+                default=data.get(CONF_CEILING_HEIGHT_M, DEFAULT_CEILING_HEIGHT_M),
+            )
+        ] = selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=1.8, max=6.0, step=0.1,
+                unit_of_measurement="m",
+                mode=selector.NumberSelectorMode.BOX,
+            )
+        )
+        schema_dict[
+            vol.Optional(
+                CONF_BUILDING_TYPE,
+                default=data.get(CONF_BUILDING_TYPE, DEFAULT_BUILDING_TYPE),
+            )
+        ] = selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=_BUILDING_TYPE_OPTIONS,
+                mode=selector.SelectSelectorMode.DROPDOWN,
+            )
+        )
 
         return self.async_show_form(
             step_id="init",

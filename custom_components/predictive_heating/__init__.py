@@ -22,7 +22,10 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    CONF_BUILDING_TYPE,
+    CONF_CEILING_HEIGHT_M,
     CONF_CLIMATE_ENTITY,
+    CONF_FLOOR_AREA_M2,
     CONF_MAX_SETPOINT_DELTA,
     CONF_ROOM_NAME,
     DEFAULT_MAX_SETPOINT_DELTA,
@@ -56,6 +59,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Load or create thermal model for this room
     model = await _load_model(hass, entry.entry_id)
+
+    # Seed a fresh model with initial H/C from room dimensions if available.
+    # Only applies when the model has no prior observations.
+    floor_area = entry.data.get(CONF_FLOOR_AREA_M2)
+    if floor_area:
+        model.seed_from_room_dimensions(
+            floor_area_m2=floor_area,
+            ceiling_height_m=entry.data.get(CONF_CEILING_HEIGHT_M),
+            building_type=entry.data.get(CONF_BUILDING_TYPE),
+        )
 
     # Register this room in its heating zone
     zone_mgr: ZoneManager = hass.data[DOMAIN]["_zone_manager"]
@@ -102,7 +115,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Persist the thermal model before unloading
     if entry.entry_id in hass.data.get(DOMAIN, {}):
         model = hass.data[DOMAIN][entry.entry_id]["model"]
-        await _save_model(hass, entry.entry_id, model)
+        await _save_model(
+            hass,
+            entry.entry_id,
+            model,
+            room_name=entry.data.get(CONF_ROOM_NAME, entry.title),
+        )
 
     unload_ok = await hass.config_entries.async_unload_platforms(
         entry, PLATFORMS_LIST
@@ -112,6 +130,28 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(entry.entry_id, None)
 
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Clean up persisted thermal-model file when a room is removed.
+
+    HA calls this after the entry has already been unloaded, so the model
+    file is the only thing left to clean up.
+    """
+    path = _get_model_path(hass, entry.entry_id)
+
+    def _delete() -> None:
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as err:
+            _LOGGER.warning("Could not delete thermal model %s: %s", path, err)
+
+    await hass.async_add_executor_job(_delete)
+    _LOGGER.info(
+        "Removed predictive-heating room '%s' and its thermal model",
+        entry.data.get(CONF_ROOM_NAME, entry.title),
+    )
 
 
 async def _async_options_updated(
@@ -124,6 +164,77 @@ async def _async_options_updated(
 def _get_model_path(hass: HomeAssistant, entry_id: str) -> Path:
     """Get the path for persisting a thermal model."""
     return Path(hass.config.path(f".storage/predictive_heating_{entry_id}.json"))
+
+
+def _get_storage_dir(hass: HomeAssistant) -> Path:
+    """Directory where thermal-model files live."""
+    return Path(hass.config.path(".storage"))
+
+
+def list_orphan_models(hass: HomeAssistant) -> list[dict]:
+    """Return persisted thermal-model files that no longer have a config entry.
+
+    Used by the dashboard's manual cleanup tool — handy for tidying up
+    after old bugs that left stale files behind.
+    """
+    storage_dir = _get_storage_dir(hass)
+    if not storage_dir.exists():
+        return []
+
+    active_ids = {
+        eid
+        for eid in hass.data.get(DOMAIN, {})
+        if not eid.startswith("_")
+    }
+
+    orphans: list[dict] = []
+    prefix = "predictive_heating_"
+    for path in storage_dir.glob(f"{prefix}*.json"):
+        entry_id = path.stem[len(prefix):]
+        if entry_id in active_ids:
+            continue
+        try:
+            stat = path.stat()
+            size = stat.st_size
+            mtime = stat.st_mtime
+        except OSError:
+            continue
+
+        room_name = entry_id
+        try:
+            data = json.loads(path.read_text())
+            room_name = data.get("room_name") or room_name
+        except Exception:  # noqa: BLE001 — best-effort label
+            pass
+
+        orphans.append(
+            {
+                "entry_id": entry_id,
+                "path": str(path),
+                "room_name": room_name,
+                "size_bytes": size,
+                "modified": mtime,
+            }
+        )
+    return orphans
+
+
+def delete_orphan_model(hass: HomeAssistant, entry_id: str) -> bool:
+    """Delete a single orphan model file. Returns True on success."""
+    storage_dir = _get_storage_dir(hass)
+    path = storage_dir / f"predictive_heating_{entry_id}.json"
+
+    # Refuse to delete a file belonging to an active entry
+    if entry_id in hass.data.get(DOMAIN, {}):
+        return False
+
+    try:
+        if path.exists():
+            path.unlink()
+            return True
+    except OSError as err:
+        _LOGGER.warning("Could not delete orphan %s: %s", path, err)
+    return False
 
 
 async def _load_model(hass: HomeAssistant, entry_id: str) -> ThermalModel:
@@ -143,13 +254,23 @@ async def _load_model(hass: HomeAssistant, entry_id: str) -> ThermalModel:
 
 
 async def _save_model(
-    hass: HomeAssistant, entry_id: str, model: ThermalModel
+    hass: HomeAssistant,
+    entry_id: str,
+    model: ThermalModel,
+    room_name: str | None = None,
 ) -> None:
-    """Persist a thermal model to disk."""
+    """Persist a thermal model to disk.
+
+    The room_name is also written into the file so the orphan-cleanup
+    dashboard can show a friendly label for stale files.
+    """
     path = _get_model_path(hass, entry_id)
 
     def _write() -> None:
+        payload = model.to_dict()
+        if room_name:
+            payload["room_name"] = room_name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(model.to_dict(), indent=2))
+        path.write_text(json.dumps(payload, indent=2))
 
     await hass.async_add_executor_job(_write)

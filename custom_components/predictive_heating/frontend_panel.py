@@ -18,7 +18,14 @@ from homeassistant.components.frontend import (
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.core import HomeAssistant, callback
 
-from .const import DOMAIN, MIN_ACTIVE_SAMPLES, MIN_IDLE_SAMPLES, STATE_CALIBRATED
+from .const import (
+    CONF_ROOM_NAME,
+    DOMAIN,
+    MIN_ACTIVE_SAMPLES,
+    MIN_IDLE_SAMPLES,
+    STATE_CALIBRATED,
+)
+from .solar import get_solar_calculation
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -60,6 +67,8 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
     # Register websocket commands
     websocket_api.async_register_command(hass, ws_get_rooms)
     websocket_api.async_register_command(hass, ws_get_room_detail)
+    websocket_api.async_register_command(hass, ws_list_orphans)
+    websocket_api.async_register_command(hass, ws_delete_orphan)
 
     _LOGGER.info("Predictive Heating dashboard registered at sidebar")
 
@@ -91,8 +100,8 @@ def ws_get_rooms(
         if model is None:
             continue
 
-        # Get current temperatures from the climate entity's state
-        climate_entity_id = f"climate.predictive_{config.get('room_name', 'unknown').lower().replace(' ', '_')}"
+        # Use the entity_id our climate entity registered (rename-safe).
+        climate_entity_id = data.get("climate_entity_id")
 
         current_temp = None
         target_temp = None
@@ -100,7 +109,9 @@ def ws_get_rooms(
         hvac_action = "idle"
 
         # Try to read from our climate entity
-        state = hass.states.get(climate_entity_id)
+        state = (
+            hass.states.get(climate_entity_id) if climate_entity_id else None
+        )
         if state:
             current_temp = state.attributes.get("current_temperature")
             target_temp = state.attributes.get("temperature")
@@ -134,19 +145,32 @@ def ws_get_rooms(
 
         # Zone info
         zone = data.get("zone")
-        zone_info = {}
+        zone_info: dict = {}
         if zone:
+            leader = zone.leading_room
+            leader_name = leader.room_name if leader else None
+            this_room_name = config.get(CONF_ROOM_NAME, "Unknown")
+
+            # Are we heating because someone *else* in the zone needs it?
+            co_heated = (
+                zone.is_heating
+                and leader_name is not None
+                and leader_name != this_room_name
+            )
+
             zone_info = {
                 "zone_id": zone.zone_id,
                 "zone_rooms": zone.room_names,
                 "zone_is_heating": zone.is_heating,
                 "zone_setpoint": zone._last_setpoint,
+                "zone_leader_room": leader_name,
+                "co_heated_by_zone": co_heated,
             }
 
         rooms.append(
             {
                 "entry_id": entry_id,
-                "room_name": config.get("room_name", "Unknown"),
+                "room_name": config.get(CONF_ROOM_NAME, "Unknown"),
                 "model_state": model.state,
                 "current_temp": current_temp,
                 "target_temp": target_temp,
@@ -196,8 +220,10 @@ def ws_get_room_detail(
     outdoor_temp = None
     hvac_action = "idle"
 
-    climate_entity_id = f"climate.predictive_{config.get('room_name', 'unknown').lower().replace(' ', '_')}"
-    state = hass.states.get(climate_entity_id)
+    climate_entity_id = data.get("climate_entity_id")
+    state = (
+        hass.states.get(climate_entity_id) if climate_entity_id else None
+    )
     if state:
         current_temp = state.attributes.get("current_temperature")
         target_temp = state.attributes.get("temperature")
@@ -270,9 +296,32 @@ def ws_get_room_detail(
             "time_to_target": round(time_to_target, 1) if time_to_target else None,
         }
 
+    # Zone info — leader & co-heat reason
+    zone = data.get("zone")
+    zone_info: dict = {}
+    if zone:
+        leader = zone.leading_room
+        leader_name = leader.room_name if leader else None
+        this_room_name = config.get(CONF_ROOM_NAME, "Unknown")
+        zone_info = {
+            "zone_id": zone.zone_id,
+            "zone_rooms": zone.room_names,
+            "zone_is_heating": zone.is_heating,
+            "zone_setpoint": zone._last_setpoint,
+            "zone_leader_room": leader_name,
+            "co_heated_by_zone": (
+                zone.is_heating
+                and leader_name is not None
+                and leader_name != this_room_name
+            ),
+        }
+
+    # Solar diagnostics — detailed breakdown
+    solar_calc = get_solar_calculation(hass)
+
     result = {
         "entry_id": entry_id,
-        "room_name": config.get("room_name", "Unknown"),
+        "room_name": config.get(CONF_ROOM_NAME, "Unknown"),
         "model_state": model.state,
         "current_temp": current_temp,
         "target_temp": target_temp,
@@ -300,6 +349,52 @@ def ws_get_room_detail(
         "h_history": h_history,
         "predictions": predictions,
         "uses_ekf": hasattr(model, "_ekf") and model._ekf is not None,
+        "solar_calc": solar_calc,
+        **zone_info,
     }
 
     connection.send_result(msg["id"], result)
+
+
+# ─── Orphan management ─────────────────────────────────────────
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "predictive_heating/list_orphans"}
+)
+@callback
+def ws_list_orphans(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """List persisted thermal-model files with no matching config entry."""
+    # Lazy import to avoid circular dependency at module load.
+    from . import list_orphan_models
+
+    orphans = list_orphan_models(hass)
+    connection.send_result(msg["id"], {"orphans": orphans})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "predictive_heating/delete_orphan",
+        vol.Required("entry_id"): str,
+    }
+)
+@callback
+def ws_delete_orphan(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Delete a single orphan thermal-model file."""
+    from . import delete_orphan_model
+
+    ok = delete_orphan_model(hass, msg["entry_id"])
+    if ok:
+        connection.send_result(msg["id"], {"deleted": True})
+    else:
+        connection.send_error(
+            msg["id"], "not_found", "No orphan file matched that entry_id"
+        )

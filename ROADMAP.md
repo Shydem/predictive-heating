@@ -54,12 +54,12 @@ What's built:
 **Goal:** The model accurately predicts how each room heats and cools.
 
 Tasks:
-- Upgrade from simple H/C ratio estimation to a proper Extended Kalman Filter (as RoomMind does), tracking: heat loss coefficient (H), thermal mass (C), heating power, and solar gain factor as state variables
-- Learn heating_power from active heating observations (currently only heat loss is learned from idle periods)
-- Add solar gain estimation using HA's sun.sun entity (elevation + azimuth) and weather integration for cloud cover
-- Implement prediction accuracy tracking (compare predicted vs actual temps) — auto-calibrate when error drops below 0.5°C
-- Add room size / thermal mass configuration helper (estimate C from floor area × ceiling height × building type)
-- Persist full observation history for model retraining after HA updates
+- ✅ EKF tracking H, C, heating power, and solar gain as state variables (`ekf.py:EKFState`)
+- ✅ Learn heating_power from active heating observations (`thermal_model.py:_learn_from_pair`)
+- ✅ Solar gain estimation from sun.sun + weather (`solar.py`)
+- ✅ Prediction accuracy tracking — auto-calibrate when error < 0.5°C (`ekf.py:is_calibrated`)
+- ✅ Room size / thermal mass configuration helper — floor area × ceiling height × building type (`thermal_model.py:estimate_initial_thermal_params`, wired through config flow)
+- ✅ Persist full observation history for model retraining across HA updates (`thermal_model.py:to_dict`)
 
 **Inspired by:** RoomMind's EKF thermal model with per-room learning.
 

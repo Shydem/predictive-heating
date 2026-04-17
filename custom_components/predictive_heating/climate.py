@@ -155,6 +155,14 @@ class PredictiveHeatingClimate(ClimateEntity):
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to sensor updates when added to HA."""
+        # Make our entity_id discoverable by the dashboard WebSocket API,
+        # so it doesn't have to guess based on the (renameable) room name.
+        domain_data = self.hass.data.setdefault(DOMAIN, {}).get(
+            self._entry.entry_id
+        )
+        if domain_data is not None:
+            domain_data["climate_entity_id"] = self.entity_id
+
         # Track temperature sensor
         self.async_on_remove(
             async_track_state_change_event(

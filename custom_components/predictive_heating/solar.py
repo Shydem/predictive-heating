@@ -61,58 +61,130 @@ def estimate_solar_irradiance(hass: HomeAssistant) -> float:
     return max(0.0, ghi)
 
 
+_CONDITION_CLOUD_MAP: dict[str, float] = {
+    "sunny": 0.0,
+    "clear-night": 0.0,
+    "partlycloudy": 0.4,
+    "cloudy": 0.8,
+    "rainy": 0.9,
+    "snowy": 0.85,
+    "fog": 0.95,
+    "hail": 0.95,
+    "lightning": 0.9,
+    "pouring": 0.95,
+    "snowy-rainy": 0.9,
+    "windy": 0.3,
+    "windy-variant": 0.5,
+    "exceptional": 0.5,
+}
+
+
+def _find_weather_entity(hass: HomeAssistant) -> tuple[str, object] | tuple[None, None]:
+    """Return the first available weather entity (id, state) — or (None, None)."""
+    # Prefer the standard names; fall back to any weather.* entity.
+    preferred = (
+        "weather.home",
+        "weather.forecast_home",
+        "weather.openweathermap",
+    )
+    for entity_id in preferred:
+        state = hass.states.get(entity_id)
+        if state is not None:
+            return entity_id, state
+
+    # Generic discovery — first weather.* in the registry
+    for state in hass.states.async_all("weather"):
+        return state.entity_id, state
+
+    return None, None
+
+
 def _get_cloud_factor(hass: HomeAssistant) -> float:
     """
     Get cloud cover correction factor from a weather entity.
 
-    Tries common weather entity IDs. Returns 1.0 (clear sky) if
-    no weather entity is found.
+    Tries common weather entity IDs first, then any weather.* entity.
+    Returns 1.0 (clear sky) if no weather entity is found.
     """
-    # Try common weather entity patterns
-    weather_entities = [
-        "weather.home",
-        "weather.forecast_home",
-        "weather.openweathermap",
-    ]
+    _, state = _find_weather_entity(hass)
+    if state is None:
+        return 1.0
 
-    for entity_id in weather_entities:
-        state = hass.states.get(entity_id)
-        if state is None:
-            continue
+    cloud_pct = state.attributes.get("cloud_coverage")
+    if cloud_pct is not None:
+        try:
+            cloud_frac = float(cloud_pct) / 100.0
+            return 1.0 - 0.75 * (cloud_frac ** 3.4)
+        except (ValueError, TypeError):
+            pass
 
-        # Some weather integrations expose cloud_coverage directly
-        cloud_pct = state.attributes.get("cloud_coverage")
-        if cloud_pct is not None:
+    cloud_frac = _CONDITION_CLOUD_MAP.get(state.state, 0.3)
+    return 1.0 - 0.75 * (cloud_frac ** 3.4)
+
+
+def get_solar_calculation(hass: HomeAssistant) -> dict:
+    """Return a fully-detailed breakdown of how solar irradiance is computed.
+
+    Used by the dashboard so the user can see *why* a particular
+    irradiance value was produced (sun position + weather).
+    """
+    sun_state = hass.states.get("sun.sun")
+    elevation = (
+        float(sun_state.attributes.get("elevation", 0.0))
+        if sun_state is not None
+        else None
+    )
+    azimuth = (
+        float(sun_state.attributes.get("azimuth", 0.0))
+        if sun_state is not None
+        else None
+    )
+
+    # Clear-sky GHI
+    ghi_clear = 0.0
+    if elevation is not None and elevation > 0:
+        sin_elev = math.sin(math.radians(elevation))
+        if sin_elev > 0:
+            ghi_clear = SOLAR_CONSTANT_SURFACE * sin_elev * math.exp(
+                -0.057 / sin_elev
+            )
+
+    # Weather entity / cloud info
+    weather_entity_id, weather_state = _find_weather_entity(hass)
+    cloud_pct: float | None = None
+    cloud_source = "none"
+    cloud_factor = 1.0
+    weather_condition: str | None = None
+
+    if weather_state is not None:
+        weather_condition = weather_state.state
+        raw = weather_state.attributes.get("cloud_coverage")
+        if raw is not None:
             try:
-                cloud_frac = float(cloud_pct) / 100.0
-                # Kasten-Czeplak cloud correction
-                return 1.0 - 0.75 * (cloud_frac ** 3.4)
+                cloud_pct = float(raw)
+                cloud_source = "cloud_coverage attribute"
             except (ValueError, TypeError):
-                pass
+                cloud_pct = None
+        if cloud_pct is None:
+            mapped = _CONDITION_CLOUD_MAP.get(weather_condition, 0.3)
+            cloud_pct = mapped * 100.0
+            cloud_source = f"condition '{weather_condition}'"
+        cloud_frac = max(0.0, min(1.0, cloud_pct / 100.0))
+        cloud_factor = 1.0 - 0.75 * (cloud_frac ** 3.4)
 
-        # Fallback: estimate from condition string
-        condition = state.state
-        cloud_map = {
-            "sunny": 0.0,
-            "clear-night": 0.0,
-            "partlycloudy": 0.4,
-            "cloudy": 0.8,
-            "rainy": 0.9,
-            "snowy": 0.85,
-            "fog": 0.95,
-            "hail": 0.95,
-            "lightning": 0.9,
-            "pouring": 0.95,
-            "snowy-rainy": 0.9,
-            "windy": 0.3,
-            "windy-variant": 0.5,
-            "exceptional": 0.5,
-        }
+    ghi = max(0.0, ghi_clear * cloud_factor)
 
-        cloud_frac = cloud_map.get(condition, 0.3)
-        return 1.0 - 0.75 * (cloud_frac ** 3.4)
-
-    return 1.0  # no weather entity found → assume clear
+    return {
+        "sun_elevation_deg": round(elevation, 2) if elevation is not None else None,
+        "sun_azimuth_deg": round(azimuth, 2) if azimuth is not None else None,
+        "weather_entity": weather_entity_id,
+        "weather_condition": weather_condition,
+        "cloud_coverage_pct": round(cloud_pct, 1) if cloud_pct is not None else None,
+        "cloud_source": cloud_source,
+        "cloud_factor": round(cloud_factor, 3),
+        "ghi_clear_sky_w_m2": round(ghi_clear, 1),
+        "ghi_w_m2": round(ghi, 1),
+    }
 
 
 def get_sun_azimuth(hass: HomeAssistant) -> float | None:
