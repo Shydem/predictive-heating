@@ -44,16 +44,24 @@ from homeassistant.helpers.event import (
 )
 
 from .const import (
+    CONF_BOILER_EFFICIENCY,
     CONF_CLIMATE_ENTITY,
+    CONF_GAS_CALORIFIC_VALUE,
+    CONF_GAS_METER_SENSOR,
+    CONF_HEAT_SHARE,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
     CONF_ROOM_NAME,
     CONF_TEMPERATURE_SENSOR,
     CONF_WINDOW_SENSORS,
+    DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_COMFORT_TEMP,
+    DEFAULT_GAS_CALORIFIC_VALUE,
+    DEFAULT_HEAT_SHARE,
     DOMAIN,
     UPDATE_INTERVAL,
 )
 from .controller import HeatingAction, HeatingController, PresetMode
+from .heat_source import GasHeatSource
 from .solar import estimate_solar_irradiance
 from .thermal_model import ThermalModel, ThermalObservation
 from .zone import HeatingZone
@@ -125,6 +133,33 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._outdoor_sensor_id = config.get(CONF_OUTDOOR_TEMPERATURE_SENSOR)
         self._window_sensor_ids = config.get(CONF_WINDOW_SENSORS, [])
 
+        # Gas / heat-source (options win over data, so users can reconfigure
+        # without re-adding the room).
+        options = entry.options
+        self._gas_sensor_id = (
+            options.get(CONF_GAS_METER_SENSOR) or config.get(CONF_GAS_METER_SENSOR)
+        )
+        self._heat_source: GasHeatSource | None = None
+        if self._gas_sensor_id:
+            self._heat_source = GasHeatSource(
+                calorific_value_mj_m3=(
+                    options.get(CONF_GAS_CALORIFIC_VALUE)
+                    or config.get(CONF_GAS_CALORIFIC_VALUE, DEFAULT_GAS_CALORIFIC_VALUE)
+                ),
+                efficiency=(
+                    options.get(CONF_BOILER_EFFICIENCY)
+                    or config.get(CONF_BOILER_EFFICIENCY, DEFAULT_BOILER_EFFICIENCY)
+                ),
+                heat_share=(
+                    options.get(CONF_HEAT_SHARE)
+                    or config.get(CONF_HEAT_SHARE, DEFAULT_HEAT_SHARE)
+                ),
+            )
+            # Restore last reading state from the model, if persisted.
+            saved = getattr(model, "_heat_source_state", None)
+            if saved:
+                self._heat_source = GasHeatSource.from_dict(saved)
+
         # State
         self._hvac_mode = HVACMode.HEAT
         self._current_temp: float | None = None
@@ -139,8 +174,7 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._attr_unique_id = f"predictive_heating_{entry.entry_id}"
         self._attr_name = f"Predictive {self._room_name}"
 
-        # Apply options overrides
-        options = entry.options
+        # Apply options overrides (options already fetched above)
         if "comfort_temp" in options:
             self._controller.preset_temps[PresetMode.COMFORT] = options["comfort_temp"]
         if "eco_temp" in options:
@@ -200,6 +234,16 @@ class PredictiveHeatingClimate(ClimateEntity):
                 self._async_underlying_changed,
             )
         )
+
+        # Track gas meter so we can derive heat input in W
+        if self._gas_sensor_id and self._heat_source is not None:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass,
+                    [self._gas_sensor_id],
+                    self._async_gas_changed,
+                )
+            )
 
         # Periodic model update
         self.async_on_remove(
@@ -282,6 +326,32 @@ class PredictiveHeatingClimate(ClimateEntity):
         self.async_write_ha_state()
 
     @callback
+    def _async_gas_changed(self, event) -> None:
+        """Handle new cumulative gas-meter reading → update heat source."""
+        if self._heat_source is None:
+            return
+        new_state = event.data.get("new_state")
+        if new_state is None or new_state.state in (
+            STATE_UNAVAILABLE,
+            STATE_UNKNOWN,
+        ):
+            return
+        try:
+            m3 = float(new_state.state)
+        except (ValueError, TypeError):
+            return
+
+        # The last_changed field is our best estimate of when this
+        # reading was taken — more precise than time.time() when the
+        # meter reports only on unit ticks.
+        ts = (
+            new_state.last_changed.timestamp()
+            if new_state.last_changed is not None
+            else time.time()
+        )
+        self._heat_source.update_reading(m3, timestamp=ts)
+
+    @callback
     def _async_underlying_changed(self, event) -> None:
         """
         Handle state changes on the underlying thermostat.
@@ -352,6 +422,13 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._update_zone_heating_state()
         actually_heating = self._zone.is_heating
 
+        # If a gas meter is configured, use its derivative for the actual
+        # thermal watts delivered since the last sample — much richer
+        # than the old binary on/off.
+        measured_heat_w: float | None = None
+        if self._heat_source is not None:
+            measured_heat_w = self._heat_source.current_power_w()
+
         # Feed observation to thermal model (EKF learns from this)
         obs = ThermalObservation(
             timestamp=time.time(),
@@ -359,6 +436,7 @@ class PredictiveHeatingClimate(ClimateEntity):
             t_outdoor=outdoor,
             heating_on=actually_heating,
             solar_irradiance=solar,
+            heat_power_w=measured_heat_w,
         )
         self._model.add_observation(obs)
 
@@ -406,23 +484,26 @@ class PredictiveHeatingClimate(ClimateEntity):
             window_open=self._window_open,
         )
 
-        # The zone decides the actual setpoint for the shared thermostat
+        # The zone decides the actual setpoint for the shared thermostat.
+        # calculate_setpoint() returns None when no change is due — we
+        # intentionally DO NOT send a command in that case, so the
+        # thermostat's OpenTherm modulation is left alone to work.
         if self._zone.any_room_wants_heat:
             setpoint = self._zone.calculate_setpoint()
             if setpoint is not None:
                 self.hass.async_create_task(
                     self._async_set_underlying_temp(setpoint)
                 )
-                self._zone._last_setpoint = setpoint
         else:
-            # No room wants heat — tell the thermostat to idle
-            # Use a setpoint just below the current temp so it stops
-            min_temp_in_zone = self._current_temp
-            idle_setpoint = max(5.0, min_temp_in_zone - 1.0)
-            self.hass.async_create_task(
-                self._async_set_underlying_temp(idle_setpoint)
-            )
-            self._zone._last_setpoint = idle_setpoint
+            # No room wants heat — idle the thermostat by asking for a
+            # low setpoint. Only do it once (when we first idle) so we
+            # don't spam the boiler.
+            if self._zone._last_setpoint is None or self._zone._last_setpoint > 10.0:
+                idle_setpoint = 5.0
+                self.hass.async_create_task(
+                    self._async_set_underlying_temp(idle_setpoint)
+                )
+                self._zone._last_setpoint = idle_setpoint
 
         # Update our HVAC action based on what the zone is actually doing
         self._update_hvac_action_from_zone()
@@ -498,10 +579,19 @@ class PredictiveHeatingClimate(ClimateEntity):
         if solar > 0:
             attrs["solar_irradiance"] = round(solar, 1)
 
+        # Gas-based heat input diagnostics
+        if self._heat_source is not None:
+            attrs["gas_meter_sensor"] = self._gas_sensor_id
+            attrs["heat_power_w"] = round(self._heat_source.current_power_w(), 1)
+            attrs["boiler_efficiency"] = self._heat_source.efficiency
+            attrs["heat_share"] = self._heat_source.heat_share
+            attrs["gas_calorific_value_mj_m3"] = self._heat_source.calorific_value_mj_m3
+
         return attrs
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set HVAC mode."""
+        prev_mode = self._hvac_mode
         self._hvac_mode = hvac_mode
         if hvac_mode == HVACMode.OFF:
             self._hvac_action = HVACAction.OFF
@@ -515,6 +605,12 @@ class PredictiveHeatingClimate(ClimateEntity):
             # Only idle the thermostat if no other room in the zone wants heat
             if not self._zone.any_room_wants_heat:
                 await self._async_set_underlying_temp(5.0)
+                self._zone.reset_setpoint_tracking()
+        elif prev_mode == HVACMode.OFF:
+            # Coming back online: drop any stale nudge history so the
+            # next cycle starts at the room target.
+            self._zone.reset_setpoint_tracking()
+            self._run_control_loop()
         self.async_write_ha_state()
 
     async def async_set_temperature(self, **kwargs) -> None:

@@ -98,8 +98,12 @@ class ThermalObservation:
     timestamp: float  # unix timestamp
     t_indoor: float  # indoor temperature (C)
     t_outdoor: float  # outdoor temperature (C)
-    heating_on: bool  # whether heating was active
+    heating_on: bool  # whether heating was active (derived boolean)
     solar_irradiance: float = 0.0  # W/m2, estimated
+    # Actual thermal power delivered to the room (W). If set, this is
+    # the preferred heat input for the EKF — it's much richer than a
+    # binary on/off because it captures modulation and DHW draws.
+    heat_power_w: float | None = None
 
 
 @dataclass
@@ -143,6 +147,10 @@ class ThermalModel:
     _last_obs: ThermalObservation | None = None
     _ekf: object | None = None  # ThermalEKF if numpy available
     _ekf_dict: dict | None = None  # for deferred EKF initialization
+    # Opaque GasHeatSource state — stashed here so the model's save/load
+    # round-trip carries it across restarts without requiring a
+    # homeassistant dependency at module level.
+    _heat_source_state: dict | None = None
 
     def __post_init__(self):
         if HAS_NUMPY and self._ekf is None:
@@ -239,6 +247,7 @@ class ThermalModel:
                 u_heat=u_heat,
                 I_solar=prev.solar_irradiance,
                 dT_measured=dT,
+                measured_heat_w=prev.heat_power_w,
             )
 
             # Sync EKF estimates back to params
@@ -403,6 +412,7 @@ class ThermalModel:
                     "t_outdoor": obs.t_outdoor,
                     "heating_on": obs.heating_on,
                     "solar_irradiance": obs.solar_irradiance,
+                    "heat_power_w": obs.heat_power_w,
                 }
             )
 
@@ -429,6 +439,9 @@ class ThermalModel:
         # Serialize EKF state if available
         if HAS_NUMPY and self._ekf is not None:
             result["ekf"] = self._ekf.to_dict()
+
+        if self._heat_source_state:
+            result["heat_source"] = self._heat_source_state
 
         return result
 
@@ -459,6 +472,7 @@ class ThermalModel:
         model.h_history = data.get("h_history", [])
         model.prediction_error_history = data.get("prediction_error_history", [])
         model._last_obs = None
+        model._heat_source_state = data.get("heat_source")
 
         # Restore observations
         model.observations = []
@@ -470,6 +484,7 @@ class ThermalModel:
                     t_outdoor=obs_data["t_outdoor"],
                     heating_on=obs_data["heating_on"],
                     solar_irradiance=obs_data.get("solar_irradiance", 0.0),
+                    heat_power_w=obs_data.get("heat_power_w"),
                 )
             )
 

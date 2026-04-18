@@ -15,22 +15,33 @@ from homeassistant.helpers import selector
 
 from .const import (
     BUILDING_TYPES,
+    CONF_BOILER_EFFICIENCY,
     CONF_BUILDING_TYPE,
     CONF_CEILING_HEIGHT_M,
     CONF_CLIMATE_ENTITY,
     CONF_FLOOR_AREA_M2,
+    CONF_GAS_CALORIFIC_VALUE,
+    CONF_GAS_METER_SENSOR,
+    CONF_HEAT_SHARE,
     CONF_HUMIDITY_SENSOR,
     CONF_MAX_SETPOINT_DELTA,
+    CONF_NUDGE_INTERVAL_MIN,
+    CONF_NUDGE_STEP,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
     CONF_ROOM_NAME,
     CONF_TEMPERATURE_SENSOR,
     CONF_WINDOW_SENSORS,
+    DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_BUILDING_TYPE,
     DEFAULT_CEILING_HEIGHT_M,
     DEFAULT_COMFORT_TEMP,
     DEFAULT_ECO_TEMP,
     DEFAULT_AWAY_TEMP,
+    DEFAULT_GAS_CALORIFIC_VALUE,
+    DEFAULT_HEAT_SHARE,
     DEFAULT_MAX_SETPOINT_DELTA,
+    DEFAULT_NUDGE_INTERVAL_MIN,
+    DEFAULT_NUDGE_STEP,
     DEFAULT_SLEEP_TEMP,
     DOMAIN,
 )
@@ -90,6 +101,37 @@ class PredictiveHeatingConfigFlow(
                         multiple=True,
                     )
                 ),
+                vol.Optional(CONF_GAS_METER_SENSOR): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain=SENSOR_DOMAIN)
+                ),
+                vol.Optional(
+                    CONF_BOILER_EFFICIENCY,
+                    default=DEFAULT_BOILER_EFFICIENCY,
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.5, max=1.10, step=0.01,
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
+                vol.Optional(
+                    CONF_HEAT_SHARE,
+                    default=DEFAULT_HEAT_SHARE,
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=0.01, max=1.0, step=0.01,
+                        mode=selector.NumberSelectorMode.SLIDER,
+                    )
+                ),
+                vol.Optional(
+                    CONF_GAS_CALORIFIC_VALUE,
+                    default=DEFAULT_GAS_CALORIFIC_VALUE,
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=20.0, max=45.0, step=0.01,
+                        unit_of_measurement="MJ/m³",
+                        mode=selector.NumberSelectorMode.BOX,
+                    )
+                ),
                 vol.Optional(CONF_FLOOR_AREA_M2): selector.NumberSelector(
                     selector.NumberSelectorConfig(
                         min=2, max=500, step=0.5,
@@ -130,15 +172,24 @@ class PredictiveHeatingConfigFlow(
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
     ) -> PredictiveHeatingOptionsFlow:
-        """Return the options flow handler."""
-        return PredictiveHeatingOptionsFlow(config_entry)
+        """Return the options flow handler.
+
+        Note: do NOT pass ``config_entry`` to the handler. Home Assistant
+        2025.12+ manages ``self.config_entry`` automatically on the
+        OptionsFlow base class. Explicitly setting it (even by passing it
+        in) raises an error and breaks the options menu with a 500
+        "config flow kon niet geladen worden" error.
+        """
+        return PredictiveHeatingOptionsFlow()
 
 
 class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
-    """Handle options for Predictive Heating."""
+    """Handle options for Predictive Heating.
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
+    Do not define ``__init__`` or assign ``self.config_entry``; the base
+    class exposes it as a managed property in HA 2025.12+ and assignment
+    now raises. Access the entry via ``self.config_entry``.
+    """
 
     async def async_step_init(
         self,
@@ -208,12 +259,79 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                 default=options.get("sleep_temp", DEFAULT_SLEEP_TEMP),
             ): vol.Coerce(float),
             vol.Optional(
-                "max_setpoint_delta",
-                default=options.get("max_setpoint_delta", DEFAULT_MAX_SETPOINT_DELTA),
+                CONF_MAX_SETPOINT_DELTA,
+                default=options.get(CONF_MAX_SETPOINT_DELTA, DEFAULT_MAX_SETPOINT_DELTA),
             ): selector.NumberSelector(
                 selector.NumberSelectorConfig(
-                    min=0.5, max=10.0, step=0.5, unit_of_measurement="°C",
+                    min=0.0, max=5.0, step=0.1, unit_of_measurement="°C",
                     mode=selector.NumberSelectorMode.SLIDER,
+                )
+            ),
+            vol.Optional(
+                CONF_NUDGE_STEP,
+                default=options.get(CONF_NUDGE_STEP, DEFAULT_NUDGE_STEP),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.1, max=1.0, step=0.1, unit_of_measurement="°C",
+                    mode=selector.NumberSelectorMode.SLIDER,
+                )
+            ),
+            vol.Optional(
+                CONF_NUDGE_INTERVAL_MIN,
+                default=options.get(
+                    CONF_NUDGE_INTERVAL_MIN, DEFAULT_NUDGE_INTERVAL_MIN
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=2, max=60, step=1, unit_of_measurement="min",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_GAS_METER_SENSOR,
+                default=(
+                    data.get(CONF_GAS_METER_SENSOR)
+                    or options.get(CONF_GAS_METER_SENSOR)
+                    or vol.UNDEFINED
+                ),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=SENSOR_DOMAIN)
+            ),
+            vol.Optional(
+                CONF_BOILER_EFFICIENCY,
+                default=options.get(
+                    CONF_BOILER_EFFICIENCY,
+                    data.get(CONF_BOILER_EFFICIENCY, DEFAULT_BOILER_EFFICIENCY),
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.5, max=1.10, step=0.01,
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_HEAT_SHARE,
+                default=options.get(
+                    CONF_HEAT_SHARE,
+                    data.get(CONF_HEAT_SHARE, DEFAULT_HEAT_SHARE),
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.01, max=1.0, step=0.01,
+                    mode=selector.NumberSelectorMode.SLIDER,
+                )
+            ),
+            vol.Optional(
+                CONF_GAS_CALORIFIC_VALUE,
+                default=options.get(
+                    CONF_GAS_CALORIFIC_VALUE,
+                    data.get(CONF_GAS_CALORIFIC_VALUE, DEFAULT_GAS_CALORIFIC_VALUE),
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=20.0, max=45.0, step=0.01,
+                    unit_of_measurement="MJ/m³",
+                    mode=selector.NumberSelectorMode.BOX,
                 )
             ),
         }

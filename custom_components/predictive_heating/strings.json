@@ -11,12 +11,20 @@
           "outdoor_temperature_sensor": "Outdoor Temperature Sensor (optional)",
           "humidity_sensor": "Humidity Sensor (optional)",
           "window_sensors": "Window/Door Sensors (optional)",
+          "gas_meter_sensor": "Gas Meter (cumulative m³, optional)",
+          "boiler_efficiency": "Boiler efficiency (0–1)",
+          "heat_share": "Fraction of boiler heat going to this room",
+          "gas_calorific_value_mj_m3": "Gas calorific value (MJ/m³)",
           "floor_area_m2": "Floor Area (m²) — optional bootstrap",
           "ceiling_height_m": "Ceiling Height (m)",
           "building_type": "Building Type"
         },
         "data_description": {
           "climate_entity": "The thermostat that controls this room. If multiple rooms use the same thermostat, they will be grouped into a zone automatically.",
+          "gas_meter_sensor": "Cumulative gas meter in m³. The integration computes its derivative to get the actual heating power in watts — much more accurate than treating heating as on/off. Later this can be replaced by a heat-pump electricity meter × COP.",
+          "boiler_efficiency": "Seasonal boiler efficiency. HR-107 condensing boilers are typically 0.95; older boilers closer to 0.85.",
+          "heat_share": "If you configure multiple rooms that share one gas meter, split the heat between them. Use 1.0 if only this room is modelled.",
+          "gas_calorific_value_mj_m3": "Energy content per m³ of gas. Dutch Groningen-gas is ~35.17 MJ/m³; other grids differ.",
           "floor_area_m2": "Used once, to seed initial heat-loss and thermal-mass estimates. Leave blank to use generic defaults — the model will learn from observations regardless.",
           "building_type": "Roughly how well-insulated this room is. Used only for the initial bootstrap; the EKF will adjust H and C as it learns."
         }
@@ -33,14 +41,25 @@
           "eco_temp": "Eco Temperature",
           "away_temp": "Away Temperature",
           "sleep_temp": "Sleep Temperature",
-          "max_setpoint_delta": "Maximum thermostat overshoot",
+          "max_setpoint_delta": "Max setpoint offset above target",
+          "nudge_step": "Setpoint nudge step",
+          "nudge_interval_min": "Minutes between nudges",
+          "gas_meter_sensor": "Gas Meter (cumulative m³)",
+          "boiler_efficiency": "Boiler efficiency (0–1)",
+          "heat_share": "Fraction of boiler heat going to this room",
+          "gas_calorific_value_mj_m3": "Gas calorific value (MJ/m³)",
           "floor_area_m2": "Floor Area (m²)",
           "ceiling_height_m": "Ceiling Height (m)",
           "building_type": "Building Type"
         },
         "data_description": {
           "room_name": "Renaming a room keeps all learned thermal properties — only the displayed name changes.",
-          "max_setpoint_delta": "How many degrees above target the thermostat setpoint can go. Lower = gentler heating, less overshoot. Default 2.5°C.",
+          "max_setpoint_delta": "How far the thermostat setpoint is allowed to drift above target. Small values (≤1°C) preserve OpenTherm modulation so the boiler/heat pump runs at the efficient flow temperature. Default 1.0°C.",
+          "nudge_step": "How much to change the thermostat setpoint when a correction is needed. Defaults to 0.5°C — small enough to keep OpenTherm happy but noticeable.",
+          "nudge_interval_min": "Minimum minutes between setpoint adjustments. Gives the boiler time to react before the next nudge.",
+          "gas_meter_sensor": "Cumulative gas meter entity. Derivative → watts of heat delivered. Leave blank to fall back to binary heating on/off.",
+          "boiler_efficiency": "Condensing boiler ≈ 0.95; non-condensing ≈ 0.85.",
+          "heat_share": "When multiple rooms share one boiler, split the boiler heat between them (total should ≈ 1.0).",
           "floor_area_m2": "Used as an initial estimate for heat loss (H) and thermal mass (C). Only applied when the model hasn't learned anything yet.",
           "building_type": "Insulation quality category. Only affects the initial estimate — the EKF takes over once it has observations."
         }

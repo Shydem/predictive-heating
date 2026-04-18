@@ -13,6 +13,16 @@ CONF_HEAT_PUMP_COP_SENSOR = "heat_pump_cop_sensor"
 CONF_HEATING_ZONE = "heating_zone"
 CONF_MAX_SETPOINT_DELTA = "max_setpoint_delta"
 
+# Gas / heat-source modelling (v0.3)
+CONF_GAS_METER_SENSOR = "gas_meter_sensor"
+CONF_BOILER_EFFICIENCY = "boiler_efficiency"
+CONF_GAS_CALORIFIC_VALUE = "gas_calorific_value_mj_m3"
+CONF_HEAT_SHARE = "heat_share"
+
+# Setpoint nudge control
+CONF_NUDGE_STEP = "nudge_step"
+CONF_NUDGE_INTERVAL_MIN = "nudge_interval_min"
+
 # Room-size / building-type bootstrap (v0.2 ROADMAP item)
 CONF_FLOOR_AREA_M2 = "floor_area_m2"
 CONF_CEILING_HEIGHT_M = "ceiling_height_m"
@@ -57,7 +67,35 @@ DEFAULT_ECO_TEMP = 18.0
 DEFAULT_AWAY_TEMP = 15.0
 DEFAULT_SLEEP_TEMP = 18.5
 DEFAULT_HYSTERESIS = 0.3  # degrees C
-DEFAULT_MAX_SETPOINT_DELTA = 2.5  # max degrees above target to send to thermostat
+# Max degrees above target we'll ever push the setpoint to. Kept small so
+# OpenTherm modulation keeps working — an OpenTherm thermostat reads a
+# large (setpoint − measured) gap as "run hot water hard", which causes
+# the overshoot we're trying to avoid.
+DEFAULT_MAX_SETPOINT_DELTA = 1.0
+# How much to step the thermostat setpoint per adjustment. Intentionally
+# small to keep the thermostat close to target so the OpenTherm curve
+# can modulate the boiler properly.
+DEFAULT_NUDGE_STEP = 0.5  # °C
+# Minimum time between setpoint changes, so we don't whipsaw the boiler
+# while the room is responding to the last adjustment.
+DEFAULT_NUDGE_INTERVAL_MIN = 10  # minutes
+# Error bands for deciding whether to nudge up / down / hold.
+NUDGE_COLD_BAND = 0.3   # °C: below target − this → nudge up
+NUDGE_WARM_BAND = 0.3   # °C: above target + this → nudge down
+
+# Gas / heat source
+# Dutch Groningen-gas upper calorific value in MJ/m³ (typical billed value).
+DEFAULT_GAS_CALORIFIC_VALUE = 35.17
+# Typical HR-107 (condensing) boiler seasonal efficiency.
+DEFAULT_BOILER_EFFICIENCY = 0.95
+# Fraction of boiler heat allocated to this room. Default 1.0 so a user
+# with one configured room (or one representative "main" room) gets all
+# the heat attributed. For zones with multiple rooms, set so the total
+# across rooms ≈ 1.0.
+DEFAULT_HEAT_SHARE = 1.0
+# Ignore gas-meter derivatives that correspond to <2 minutes of data —
+# these are usually noise when the meter ticks over a full unit.
+MIN_GAS_DT_SECONDS = 60
 
 # Thermal model states
 STATE_LEARNING = "learning"

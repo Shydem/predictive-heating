@@ -124,8 +124,14 @@ class ThermalEKF:
         T_out: float,
         u_heat: float,
         I_solar: float,
+        measured_heat_w: float | None = None,
     ) -> float:
-        """Predict temperature change using current parameter estimates."""
+        """Predict temperature change using current parameter estimates.
+
+        If ``measured_heat_w`` is given, it replaces the P_heat*u_heat
+        term — we know the actual watts delivered, so the filter only
+        needs to learn H, C and S.
+        """
         x = self.state.x
         H = x[IDX_H]
         C = x[IDX_C]
@@ -135,7 +141,8 @@ class ThermalEKF:
         if C <= 0:
             return 0.0
 
-        dT = dt / C * (P * u_heat + S * I_solar - H * (T_in - T_out))
+        q_heat = measured_heat_w if measured_heat_w is not None else P * u_heat
+        dT = dt / C * (q_heat + S * I_solar - H * (T_in - T_out))
         return float(dT)
 
     def _measurement_jacobian(
@@ -145,16 +152,14 @@ class ThermalEKF:
         T_out: float,
         u_heat: float,
         I_solar: float,
+        measured_heat_w: float | None = None,
     ) -> np.ndarray:
         """
-        Compute the Jacobian of the measurement function h(x) w.r.t. state x.
+        Compute the Jacobian of h(x) w.r.t. state x.
 
-        h(x) = dt/C * (P*u_heat + S*I_solar - H*(T_in - T_out))
-
-        dh/dH = -dt/C * (T_in - T_out)
-        dh/dC = -dt/C^2 * (P*u_heat + S*I_solar - H*(T_in - T_out))
-        dh/dP = dt/C * u_heat
-        dh/dS = dt/C * I_solar
+        With a measured heat input, the P_heat state has no influence on
+        the prediction (dh/dP = 0), which effectively freezes that state
+        while still updating H, C and S.
         """
         x = self.state.x
         H = x[IDX_H]
@@ -166,12 +171,15 @@ class ThermalEKF:
             return np.zeros((1, N_STATES))
 
         delta_T = T_in - T_out
-        total_power = P * u_heat + S * I_solar - H * delta_T
+        q_heat = measured_heat_w if measured_heat_w is not None else P * u_heat
+        total_power = q_heat + S * I_solar - H * delta_T
 
         J = np.zeros((1, N_STATES))
         J[0, IDX_H] = -dt / C * delta_T
         J[0, IDX_C] = -dt / (C * C) * total_power
-        J[0, IDX_P] = dt / C * u_heat
+        if measured_heat_w is None:
+            J[0, IDX_P] = dt / C * u_heat
+        # else: dh/dP = 0, P is not updated this step
         J[0, IDX_S] = dt / C * I_solar
 
         return J
@@ -184,6 +192,7 @@ class ThermalEKF:
         u_heat: float,
         I_solar: float,
         dT_measured: float,
+        measured_heat_w: float | None = None,
     ) -> float:
         """
         Run one EKF update step.
@@ -192,9 +201,14 @@ class ThermalEKF:
             dt: time interval in hours
             T_in: indoor temp at start
             T_out: outdoor temp
-            u_heat: 1.0 if heating, 0.0 if not
+            u_heat: 1.0 if heating, 0.0 if not (ignored when
+                ``measured_heat_w`` is given)
             I_solar: solar irradiance (W/m2)
             dT_measured: actual temperature change
+            measured_heat_w: if provided, the actual watts delivered to
+                the room over the interval (from a gas meter derivative
+                or heat-pump electric × COP). When set, the EKF skips
+                the P_heat update and learns H/C/S from real heat data.
 
         Returns:
             Prediction error (innovation) for this step.
@@ -205,17 +219,19 @@ class ThermalEKF:
         s = self.state
 
         # ── Prediction step (parameters are constant + noise) ──
-        # x_pred = x  (random walk model)
-        # P_pred = P + Q
         P_pred = s.P + s.Q
 
         # ── Update step ──
-        # Innovation (measurement residual)
-        dT_predicted = self.predict_dT(dt, T_in, T_out, u_heat, I_solar)
+        dT_predicted = self.predict_dT(
+            dt, T_in, T_out, u_heat, I_solar, measured_heat_w
+        )
         innovation = dT_measured - dT_predicted
 
-        # Jacobian
-        H_jac = self._measurement_jacobian(dt, T_in, T_out, u_heat, I_solar)
+        # Jacobian — if measured_heat_w is set, dh/dP = 0, so P_heat
+        # isn't adjusted from this observation.
+        H_jac = self._measurement_jacobian(
+            dt, T_in, T_out, u_heat, I_solar, measured_heat_w
+        )
 
         # Innovation covariance: S = H @ P_pred @ H^T + R
         S = H_jac @ P_pred @ H_jac.T + s.R
