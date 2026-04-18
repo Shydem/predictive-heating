@@ -17,7 +17,8 @@
           "gas_calorific_value_mj_m3": "Gas calorific value (MJ/m³)",
           "floor_area_m2": "Floor Area (m²) — optional bootstrap",
           "ceiling_height_m": "Ceiling Height (m)",
-          "building_type": "Building Type"
+          "building_type": "Building Type",
+          "schedule_entity": "Schedule entity (optional)"
         },
         "data_description": {
           "climate_entity": "The thermostat that controls this room. If multiple rooms use the same thermostat, they will be grouped into a zone automatically.",
@@ -26,7 +27,8 @@
           "heat_share": "If you configure multiple rooms that share one gas meter, split the heat between them. Use 1.0 if only this room is modelled.",
           "gas_calorific_value_mj_m3": "Energy content per m³ of gas. Dutch Groningen-gas is ~35.17 MJ/m³; other grids differ.",
           "floor_area_m2": "Used once, to seed initial heat-loss and thermal-mass estimates. Leave blank to use generic defaults — the model will learn from observations regardless.",
-          "building_type": "Roughly how well-insulated this room is. Used only for the initial bootstrap; the EKF will adjust H and C as it learns."
+          "building_type": "Roughly how well-insulated this room is. Used only for the initial bootstrap; the EKF will adjust H and C as it learns.",
+          "schedule_entity": "Point to a schedule.* entity — the room target temperature will follow its ON/OFF state automatically. You can fine-tune the temperatures in the room's options."
         }
       }
     }
@@ -50,7 +52,10 @@
           "gas_calorific_value_mj_m3": "Gas calorific value (MJ/m³)",
           "floor_area_m2": "Floor Area (m²)",
           "ceiling_height_m": "Ceiling Height (m)",
-          "building_type": "Building Type"
+          "building_type": "Building Type",
+          "schedule_entity": "Schedule entity to follow",
+          "schedule_on_temp": "Temperature when schedule is ON",
+          "schedule_off_temp": "Temperature when schedule is OFF"
         },
         "data_description": {
           "room_name": "Renaming a room keeps all learned thermal properties — only the displayed name changes.",
@@ -61,7 +66,10 @@
           "boiler_efficiency": "Condensing boiler ≈ 0.95; non-condensing ≈ 0.85.",
           "heat_share": "When multiple rooms share one boiler, split the boiler heat between them (total should ≈ 1.0).",
           "floor_area_m2": "Used as an initial estimate for heat loss (H) and thermal mass (C). Only applied when the model hasn't learned anything yet.",
-          "building_type": "Insulation quality category. Only affects the initial estimate — the EKF takes over once it has observations."
+          "building_type": "Insulation quality category. Only affects the initial estimate — the EKF takes over once it has observations.",
+          "schedule_entity": "Leave blank to set the temperature manually. When set, the room target follows this schedule entity's ON/OFF state. If the schedule slot defines a `temperature` attribute, that wins over the on/off defaults.",
+          "schedule_on_temp": "Target temperature while the schedule entity is ON. Defaults to the Comfort temperature.",
+          "schedule_off_temp": "Target temperature while the schedule entity is OFF. Defaults to the Eco temperature."
         }
       }
     }

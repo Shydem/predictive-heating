@@ -51,10 +51,15 @@ from .const import (
     CONF_HEAT_SHARE,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
     CONF_ROOM_NAME,
+    CONF_SCHEDULE_ENTITY,
+    CONF_SCHEDULE_OFF_TEMP,
+    CONF_SCHEDULE_ON_TEMP,
     CONF_TEMPERATURE_SENSOR,
     CONF_WINDOW_SENSORS,
+    DEFAULT_AWAY_TEMP,
     DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_COMFORT_TEMP,
+    DEFAULT_ECO_TEMP,
     DEFAULT_GAS_CALORIFIC_VALUE,
     DEFAULT_HEAT_SHARE,
     DOMAIN,
@@ -170,6 +175,32 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._window_open = False
         self._wants_heat = False
 
+        # Schedule-entity integration (optional).
+        # The user can point us at a `schedule.*` entity and we follow
+        # its on/off state. On ON → schedule_on_temp (default comfort),
+        # on OFF → schedule_off_temp (default eco). If the schedule
+        # entity exposes a `temperature` attribute (newer HA versions),
+        # that wins. Leaves the user's manual setpoint alone when the
+        # schedule isn't configured.
+        self._schedule_entity_id: str | None = (
+            options.get(CONF_SCHEDULE_ENTITY)
+            or config.get(CONF_SCHEDULE_ENTITY)
+        )
+        self._schedule_on_temp = float(
+            options.get(
+                CONF_SCHEDULE_ON_TEMP,
+                options.get("comfort_temp", DEFAULT_COMFORT_TEMP),
+            )
+        )
+        self._schedule_off_temp = float(
+            options.get(
+                CONF_SCHEDULE_OFF_TEMP,
+                options.get("eco_temp", DEFAULT_ECO_TEMP),
+            )
+        )
+        self._schedule_active_state: str | None = None
+        self._schedule_override_temp: float | None = None
+
         # Entity attributes
         self._attr_unique_id = f"predictive_heating_{entry.entry_id}"
         self._attr_name = f"Predictive {self._room_name}"
@@ -245,6 +276,16 @@ class PredictiveHeatingClimate(ClimateEntity):
                 )
             )
 
+        # Track schedule entity so target temp auto-follows it.
+        if self._schedule_entity_id:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass,
+                    [self._schedule_entity_id],
+                    self._async_schedule_changed,
+                )
+            )
+
         # Periodic model update
         self.async_on_remove(
             async_track_time_interval(
@@ -256,6 +297,10 @@ class PredictiveHeatingClimate(ClimateEntity):
 
         # Read initial states
         self._read_current_state()
+
+        # Apply the schedule's current state if configured.
+        if self._schedule_entity_id:
+            self._apply_schedule_state(self.hass.states.get(self._schedule_entity_id))
 
     def _read_current_state(self) -> None:
         """Read current sensor values."""
@@ -350,6 +395,62 @@ class PredictiveHeatingClimate(ClimateEntity):
             else time.time()
         )
         self._heat_source.update_reading(m3, timestamp=ts)
+
+    @callback
+    def _async_schedule_changed(self, event) -> None:
+        """Schedule entity changed state → re-apply target temp."""
+        new_state = event.data.get("new_state")
+        self._apply_schedule_state(new_state)
+        # Re-run the control loop now that target may have shifted.
+        self._run_control_loop()
+        self.async_write_ha_state()
+
+    def _apply_schedule_state(self, state) -> None:
+        """
+        Translate a schedule-entity state into a target temperature.
+
+        The user configures two presets on the config flow:
+          - ``schedule_on_temp``  (applied when the schedule is ON)
+          - ``schedule_off_temp`` (applied when the schedule is OFF)
+
+        Additionally, if the schedule state exposes a ``temperature``
+        attribute (newer HA per-slot data), that overrides the on/off
+        default.
+        """
+        if state is None:
+            self._schedule_active_state = None
+            self._schedule_override_temp = None
+            return
+
+        s = state.state
+        self._schedule_active_state = s
+
+        # Per-slot override
+        override = state.attributes.get("temperature")
+        try:
+            override_val = float(override) if override is not None else None
+        except (TypeError, ValueError):
+            override_val = None
+        self._schedule_override_temp = override_val
+
+        if override_val is not None:
+            new_target = override_val
+        elif s == "on":
+            new_target = self._schedule_on_temp
+        elif s == "off":
+            new_target = self._schedule_off_temp
+        else:
+            # Unavailable / unknown — leave the current target alone.
+            return
+
+        # Only override if the user hasn't just set a manual target via
+        # the climate entity. We always override — it's what "follow
+        # schedule" means. If the user wants manual control, they
+        # simply don't configure a schedule entity (or they can clear
+        # it in options).
+        if abs(new_target - self._target_temp) > 0.01:
+            self._target_temp = new_target
+            self._controller.set_target_temp(new_target)
 
     @callback
     def _async_underlying_changed(self, event) -> None:
@@ -586,6 +687,19 @@ class PredictiveHeatingClimate(ClimateEntity):
             attrs["boiler_efficiency"] = self._heat_source.efficiency
             attrs["heat_share"] = self._heat_source.heat_share
             attrs["gas_calorific_value_mj_m3"] = self._heat_source.calorific_value_mj_m3
+
+        # Schedule diagnostics
+        if self._schedule_entity_id:
+            attrs["schedule_entity"] = self._schedule_entity_id
+            attrs["schedule_state"] = self._schedule_active_state
+            attrs["schedule_on_temp"] = self._schedule_on_temp
+            attrs["schedule_off_temp"] = self._schedule_off_temp
+            attrs["schedule_override_temp"] = self._schedule_override_temp
+
+        # Window detection summary
+        if self._window_sensor_ids:
+            attrs["window_sensors"] = list(self._window_sensor_ids)
+            attrs["window_open"] = self._window_open
 
         return attrs
 

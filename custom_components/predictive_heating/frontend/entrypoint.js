@@ -90,11 +90,62 @@ class PredictiveHeatingPanel extends HTMLElement {
       });
       this._roomDetail = result;
       this._selectedRoom = entryId;
+      this._roomDetailError = null;
     } catch (e) {
       console.error("Failed to load room detail:", e);
-      this._roomDetail = null;
+      // Keep the user in detail mode but show an error — otherwise clicks
+      // on the card silently do nothing, which looks broken.
+      const overview = (this._rooms || []).find((r) => r.entry_id === entryId);
+      this._selectedRoom = entryId;
+      this._roomDetail = {
+        entry_id: entryId,
+        room_name: (overview && overview.room_name) || "Room",
+        _error:
+          (e && (e.message || e.error || e.code)) || "Unknown error",
+      };
+      this._roomDetailError = e;
     }
     this._render();
+  }
+
+  // ── Control actions ───────────────────────────────────────
+  async _setTemperature(entryId, temperature) {
+    try {
+      await this._hass.callWS({
+        type: "predictive_heating/set_temperature",
+        entry_id: entryId,
+        temperature,
+      });
+      await this._refresh();
+    } catch (e) {
+      console.error("Failed to set temperature:", e);
+      alert("Could not set temperature: " + (e.message || e));
+    }
+  }
+
+  async _adjustTemperature(entryId, delta) {
+    const room =
+      (this._selectedRoom && this._roomDetail && this._roomDetail.entry_id === entryId)
+        ? this._roomDetail
+        : this._rooms.find((r) => r.entry_id === entryId);
+    if (!room) return;
+    const current = Number(room.target_temp ?? 20);
+    const next = Math.round((current + delta) * 2) / 2; // snap to 0.5
+    await this._setTemperature(entryId, next);
+  }
+
+  async _setPreset(entryId, preset) {
+    try {
+      await this._hass.callWS({
+        type: "predictive_heating/set_preset",
+        entry_id: entryId,
+        preset_mode: preset,
+      });
+      await this._refresh();
+    } catch (e) {
+      console.error("Failed to set preset:", e);
+      alert("Could not set preset: " + (e.message || e));
+    }
   }
 
   async _deleteOrphan(entryId) {
@@ -124,6 +175,7 @@ class PredictiveHeatingPanel extends HTMLElement {
   _goBack() {
     this._selectedRoom = null;
     this._roomDetail = null;
+    this._roomDetailError = null;
     this._render();
   }
 
@@ -206,8 +258,34 @@ class PredictiveHeatingPanel extends HTMLElement {
     );
 
     root.querySelectorAll(".room-card").forEach((card) => {
-      card.addEventListener("click", () => {
+      card.addEventListener("click", (ev) => {
+        // Don't navigate when clicking inline controls.
+        if (ev.target.closest('[data-action="stop"]')) return;
+        if (ev.target.closest(".step-btn")) return;
+        if (ev.target.closest(".preset-chip")) return;
         this._selectRoom(card.dataset.entryId);
+      });
+    });
+
+    // Inline step buttons (+/-) on cards and in the detail view.
+    root.querySelectorAll('[data-action="temp-up"]').forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        this._adjustTemperature(btn.dataset.entryId, 0.5);
+      });
+    });
+    root.querySelectorAll('[data-action="temp-down"]').forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        this._adjustTemperature(btn.dataset.entryId, -0.5);
+      });
+    });
+
+    // Preset chips.
+    root.querySelectorAll('[data-action="preset"]').forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        this._setPreset(btn.dataset.entryId, btn.dataset.preset);
       });
     });
 
@@ -277,39 +355,98 @@ class PredictiveHeatingPanel extends HTMLElement {
   }
 
   _renderRoomCard(room, isMultiRoom) {
-    const calibrated = room.model_state === "calibrated";
+    const state = room.model_state || "unknown";
+    const calibrated = state === "calibrated";
     const stateIcon = calibrated ? "mdi:check-circle" : "mdi:progress-clock";
     const stateColor = calibrated
       ? "var(--success-color, var(--label-badge-green, #4caf50))"
       : "var(--warning-color, var(--label-badge-yellow, #ff9800))";
-    const progressPct = Math.min(100, room.learning_progress || 0);
+    const progressPct = Math.min(100, this._num(room.learning_progress, 0));
 
     const isHeating = room.zone_is_heating || room.hvac_action === "heating";
     const coHeated = room.co_heated_by_zone === true;
+    const windowOpen = room.window_open === true;
+    const hasSchedule = !!room.schedule_entity;
+    const scheduleOn =
+      room.schedule_state === "on" || room.schedule_state === true;
 
     const card = document.createElement("article");
     card.className = `room-card ${isHeating ? "is-heating" : ""} ${
       coHeated ? "is-co-heated" : ""
-    }`;
+    } ${windowOpen ? "is-window-open" : ""}`;
     card.dataset.entryId = room.entry_id;
 
     const coHeatBanner = coHeated
       ? `<div class="co-heat-banner" title="The thermostat is firing for another room in the zone — this room receives some heat as a side effect.">
           <ha-icon icon="mdi:link-variant"></ha-icon>
-          <span>Co-heated because <strong>${room.zone_leader_room}</strong> is below target</span>
+          <span>Co-heated because <strong>${this._escape(room.zone_leader_room || "")}</strong> is below target</span>
         </div>`
       : "";
 
+    const windowBanner = windowOpen
+      ? `<div class="window-banner" title="Heating is paused because a window/door sensor reports open.">
+          <ha-icon icon="mdi:window-open-variant"></ha-icon>
+          <span>Window/door open — heating paused</span>
+        </div>`
+      : "";
+
+    const preset = room.preset_mode || null;
+    const presetChips = ["comfort", "eco", "away", "sleep"]
+      .map((p) => {
+        const active = preset === p;
+        return `<button class="preset-chip ${active ? "active" : ""}"
+                       data-action="preset"
+                       data-entry-id="${room.entry_id}"
+                       data-preset="${p}"
+                       title="Set preset: ${p}">${p}</button>`;
+      })
+      .join("");
+
+    const heatPowerW = this._num(room.heat_power_w, null);
+    const heatPowerStr =
+      heatPowerW != null && !Number.isNaN(heatPowerW)
+        ? `${Math.round(heatPowerW)} W`
+        : null;
+
+    const statusChips = [];
+    if (hasSchedule) {
+      statusChips.push(
+        `<span class="chip schedule ${scheduleOn ? "on" : "off"}" title="Following ${this._escape(
+          room.schedule_entity
+        )}">
+          <ha-icon icon="mdi:calendar-clock"></ha-icon>
+          Schedule ${scheduleOn ? "ON" : "OFF"}
+        </span>`
+      );
+    }
+    if (heatPowerStr) {
+      statusChips.push(
+        `<span class="chip" title="Heat delivered right now (from gas-meter derivative × efficiency × heat share)">
+          <ha-icon icon="mdi:fire"></ha-icon>
+          ${heatPowerStr}
+        </span>`
+      );
+    }
+    if (room.climate_entity_id) {
+      statusChips.push(
+        `<span class="chip mono" title="The thermostat this room controls">
+          <ha-icon icon="mdi:thermostat"></ha-icon>
+          ${this._escape(String(room.climate_entity_id).replace(/^climate\./, ""))}
+        </span>`
+      );
+    }
+
     card.innerHTML = `
       <header class="room-card-header">
-        <span class="room-name">${room.room_name}</span>
+        <span class="room-name">${this._escape(room.room_name || "Room")}</span>
         <span class="model-badge" style="--badge-color:${stateColor}">
           <ha-icon icon="${stateIcon}"></ha-icon>
-          ${room.model_state}
+          ${this._escape(state)}
         </span>
       </header>
 
       ${coHeatBanner}
+      ${windowBanner}
 
       <div class="temp-display">
         <div class="temp-block">
@@ -317,9 +454,19 @@ class PredictiveHeatingPanel extends HTMLElement {
           <span class="temp-value">${this._fmt(room.current_temp, "°")}</span>
           <span class="temp-label">Indoor</span>
         </div>
-        <div class="temp-block">
+        <div class="temp-block target-block">
           <ha-icon icon="mdi:target"></ha-icon>
-          <span class="temp-value">${this._fmt(room.target_temp, "°")}</span>
+          <div class="target-controls" data-action="stop">
+            <button class="step-btn"
+                    data-action="temp-down"
+                    data-entry-id="${room.entry_id}"
+                    title="Decrease target by 0.5 °C">−</button>
+            <span class="temp-value">${this._fmt(room.target_temp, "°")}</span>
+            <button class="step-btn"
+                    data-action="temp-up"
+                    data-entry-id="${room.entry_id}"
+                    title="Increase target by 0.5 °C">+</button>
+          </div>
           <span class="temp-label">Target</span>
         </div>
         <div class="temp-block">
@@ -328,6 +475,8 @@ class PredictiveHeatingPanel extends HTMLElement {
           <span class="temp-label">Outdoor</span>
         </div>
       </div>
+
+      <div class="preset-row" data-action="stop">${presetChips}</div>
 
       <div class="progress-section">
         <div class="progress-header">
@@ -338,10 +487,16 @@ class PredictiveHeatingPanel extends HTMLElement {
           <div class="progress-fill" style="width:${progressPct}%;background:${stateColor}"></div>
         </div>
         <div class="progress-detail">
-          <span>Idle: ${room.idle_samples}/${room.min_idle}</span>
-          <span>Active: ${room.active_samples}/${room.min_active}</span>
+          <span>Idle: ${this._num(room.idle_samples, 0)}/${this._num(room.min_idle, 0)}</span>
+          <span>Active: ${this._num(room.active_samples, 0)}/${this._num(room.min_active, 0)}</span>
         </div>
       </div>
+
+      ${
+        statusChips.length
+          ? `<div class="status-chips">${statusChips.join("")}</div>`
+          : ""
+      }
 
       <footer class="room-card-footer">
         <span class="hvac-state ${isHeating ? "heating" : "idle"}">
@@ -351,11 +506,22 @@ class PredictiveHeatingPanel extends HTMLElement {
           ${isHeating ? "Heating" : "Idle"}
         </span>
         <span class="heat-loss" title="Heat loss coefficient">
-          H = ${room.heat_loss_coeff.toFixed(1)} W/K
+          H = ${this._fix(room.heat_loss_coeff, 1)} W/K
         </span>
       </footer>
     `;
     return card;
+  }
+
+  // Escape HTML for anywhere we interpolate user/entity strings.
+  _escape(s) {
+    if (s == null) return "";
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
   }
 
   // ─── Orphan section ───────────────────────────────────────
@@ -408,6 +574,43 @@ class PredictiveHeatingPanel extends HTMLElement {
     const detail = document.createElement("div");
     detail.className = "detail-view";
 
+    // Error state — always show something actionable instead of a blank panel.
+    if (d._error) {
+      detail.innerHTML = `
+        <div class="section error-section">
+          <h2><ha-icon icon="mdi:alert-circle-outline"></ha-icon>Could not load room</h2>
+          <p class="hint">
+            Something went wrong while loading this room's thermal model.
+            The rest of the dashboard is unaffected. You can retry below.
+          </p>
+          <pre class="error-detail">${this._escape(d._error)}</pre>
+          <div class="error-actions">
+            <button class="primary-btn" id="retry-room-btn">
+              <ha-icon icon="mdi:refresh"></ha-icon>
+              Retry
+            </button>
+            <button class="secondary-btn" id="back-from-error-btn">
+              <ha-icon icon="mdi:arrow-left"></ha-icon>
+              Back to rooms
+            </button>
+          </div>
+        </div>
+      `;
+      container.appendChild(detail);
+      this.shadowRoot
+        .getElementById("retry-room-btn")
+        ?.addEventListener("click", () => this._loadRoomDetail(d.entry_id));
+      this.shadowRoot
+        .getElementById("back-from-error-btn")
+        ?.addEventListener("click", () => this._goBack());
+      return;
+    }
+
+    // Normalize defensive access — backend does the same, but belt-and-braces.
+    const params = d.params || {};
+    const predictions = d.predictions || null;
+    const solar = d.solar_calc || null;
+
     // ── Stats row ──
     const heatingNow =
       d.hvac_action === "heating" || d.zone_is_heating === true;
@@ -418,9 +621,58 @@ class PredictiveHeatingPanel extends HTMLElement {
         ${this._statCard("mdi:snowflake", this._fmt(d.outdoor_temp, "°C"), "Outdoor")}
         ${this._statCard(
           heatingNow ? "mdi:fire" : "mdi:power-sleep",
-          d.hvac_action || "idle",
+          this._escape(d.hvac_action || "idle"),
           "Action"
         )}
+      </div>
+    `;
+
+    // ── Controls (temperature + presets) ──
+    const entryId = d.entry_id;
+    const preset = d.preset_mode || null;
+    const presetModes = Array.isArray(d.preset_modes) && d.preset_modes.length
+      ? d.preset_modes
+      : ["comfort", "eco", "away", "sleep"];
+    const presetChips = presetModes
+      .map(
+        (p) => `<button class="preset-chip ${preset === p ? "active" : ""}"
+                       data-action="preset"
+                       data-entry-id="${entryId}"
+                       data-preset="${this._escape(p)}">${this._escape(p)}</button>`
+      )
+      .join("");
+
+    detail.innerHTML += `
+      <div class="section controls-section">
+        <h2><ha-icon icon="mdi:tune"></ha-icon>Control</h2>
+        <p class="hint">
+          Adjust the target temperature directly here or pick a preset. Changes
+          are sent to the thermostat via the predictive controller and will be
+          re-evaluated on the next nudge cycle.
+        </p>
+        <div class="big-target">
+          <button class="big-step-btn"
+                  data-action="temp-down"
+                  data-entry-id="${entryId}"
+                  title="Decrease target by 0.5 °C">−</button>
+          <div class="big-target-value">
+            <span class="big-target-number">${this._fmt(d.target_temp, "")}</span>
+            <span class="big-target-unit">°C target</span>
+          </div>
+          <button class="big-step-btn"
+                  data-action="temp-up"
+                  data-entry-id="${entryId}"
+                  title="Increase target by 0.5 °C">+</button>
+        </div>
+        <div class="preset-row">${presetChips}</div>
+        ${
+          d.climate_entity_id
+            ? `<div class="kv subtle">
+                <span>Thermostat entity</span>
+                <strong class="mono">${this._escape(d.climate_entity_id)}</strong>
+              </div>`
+            : ""
+        }
       </div>
     `;
 
@@ -450,9 +702,7 @@ class PredictiveHeatingPanel extends HTMLElement {
               </div>
               <div class="kv">
                 <span>Zone setpoint</span>
-                <strong>${
-                  d.zone_setpoint != null ? d.zone_setpoint.toFixed(1) + " °C" : "—"
-                }</strong>
+                <strong>${this._fmt(d.zone_setpoint, " °C")}</strong>
               </div>
             </div>
             ${
@@ -484,25 +734,25 @@ class PredictiveHeatingPanel extends HTMLElement {
         <div class="params-grid">
           ${this._paramCard(
             "Heat loss coefficient (H)",
-            d.params.heat_loss_coeff.toFixed(1),
+            this._fix(params.heat_loss_coeff, 1),
             "W/K",
             "How fast the room loses heat per °C indoor/outdoor difference"
           )}
           ${this._paramCard(
             "Thermal mass (C)",
-            d.params.thermal_mass.toFixed(0),
+            this._fix(params.thermal_mass, 0),
             "kJ/K",
             "Stored energy capacity — higher means slower to heat or cool"
           )}
           ${this._paramCard(
             "Heating power",
-            d.params.heating_power.toFixed(0),
+            this._fix(params.heating_power, 0),
             "W",
             "Effective heat delivered to this room when the system is firing"
           )}
           ${this._paramCard(
             "Solar gain factor",
-            d.params.solar_gain_factor.toFixed(2),
+            this._fix(params.solar_gain_factor, 2),
             "",
             "Fraction of incoming solar irradiance that warms the room"
           )}
@@ -515,12 +765,12 @@ class PredictiveHeatingPanel extends HTMLElement {
           ${
             d.mean_prediction_error != null
               ? `<span class="info-badge ${
-                  d.mean_prediction_error < 0.5 ? "ok" : ""
+                  this._num(d.mean_prediction_error, 1) < 0.5 ? "ok" : ""
                 }">
                   <ha-icon icon="mdi:bullseye-arrow"></ha-icon>
-                  Prediction accuracy ±${d.mean_prediction_error.toFixed(3)} °C
+                  Prediction accuracy ±${this._fix(d.mean_prediction_error, 3)} °C
                   ${
-                    d.mean_prediction_error < 0.5
+                    this._num(d.mean_prediction_error, 1) < 0.5
                       ? ""
                       : "(target: &lt; 0.5 °C)"
                   }
@@ -531,10 +781,197 @@ class PredictiveHeatingPanel extends HTMLElement {
       </div>
     `;
 
+    // ── Schedule card (if configured) ──
+    const sched = d.schedule || null;
+    if (sched && sched.entity_id) {
+      const isOn = sched.state === "on" || sched.state === true;
+      detail.innerHTML += `
+        <div class="section schedule-section">
+          <h2><ha-icon icon="mdi:calendar-clock"></ha-icon>Schedule</h2>
+          <p class="hint">
+            The target temperature follows this schedule automatically. If the
+            schedule slot defines a <code>temperature</code> attribute, that
+            overrides the on/off defaults.
+          </p>
+          <div class="schedule-grid">
+            <div class="schedule-block">
+              <div class="schedule-label">Entity</div>
+              <div class="schedule-value mono">${this._escape(sched.entity_id)}</div>
+            </div>
+            <div class="schedule-block ${isOn ? "on" : "off"}">
+              <div class="schedule-label">State</div>
+              <div class="schedule-value">
+                <ha-icon icon="${isOn ? "mdi:toggle-switch" : "mdi:toggle-switch-off-outline"}"></ha-icon>
+                ${isOn ? "ON" : "OFF"}
+              </div>
+            </div>
+            <div class="schedule-block">
+              <div class="schedule-label">Temp when ON</div>
+              <div class="schedule-value">${this._fmt(sched.on_temp, " °C")}</div>
+            </div>
+            <div class="schedule-block">
+              <div class="schedule-label">Temp when OFF</div>
+              <div class="schedule-value">${this._fmt(sched.off_temp, " °C")}</div>
+            </div>
+            ${
+              sched.override_temp != null
+                ? `<div class="schedule-block highlight">
+                    <div class="schedule-label">Slot override</div>
+                    <div class="schedule-value">${this._fmt(sched.override_temp, " °C")}</div>
+                    <div class="schedule-sublabel">From the active schedule slot</div>
+                  </div>`
+                : ""
+            }
+          </div>
+        </div>
+      `;
+    }
+
+    // ── Window / door sensors ──
+    const winSensors = Array.isArray(d.window_sensors) ? d.window_sensors : [];
+    if (winSensors.length > 0 || d.window_open != null) {
+      const open = d.window_open === true;
+      const items = winSensors
+        .map(
+          (w) => `<li class="window-item ${w.state === "on" ? "open" : ""}">
+            <ha-icon icon="${
+              w.state === "on" ? "mdi:window-open-variant" : "mdi:window-closed-variant"
+            }"></ha-icon>
+            <span class="mono">${this._escape(w.entity_id || "")}</span>
+            <span class="window-state">${this._escape(w.state || "unknown")}</span>
+            ${
+              w.friendly_name
+                ? `<span class="window-friendly">${this._escape(w.friendly_name)}</span>`
+                : ""
+            }
+          </li>`
+        )
+        .join("");
+      detail.innerHTML += `
+        <div class="section window-section ${open ? "open" : ""}">
+          <h2>
+            <ha-icon icon="${
+              open ? "mdi:window-open-variant" : "mdi:window-closed-variant"
+            }"></ha-icon>
+            Window / door sensors
+          </h2>
+          <p class="hint">
+            When any sensor here reports <code>on</code>, heating for this room
+            is paused so you don't heat the outside. Learning is also paused
+            during open-window events.
+          </p>
+          ${
+            items
+              ? `<ul class="window-list">${items}</ul>`
+              : `<p class="empty-inline">No sensors configured.</p>`
+          }
+        </div>
+      `;
+    }
+
+    // ── Gas / heat-power diagnostics ──
+    if (d.gas_meter_sensor || d.heat_power_w != null) {
+      const kw = this._num(d.heat_power_w, 0) / 1000;
+      detail.innerHTML += `
+        <div class="section">
+          <h2><ha-icon icon="mdi:fire"></ha-icon>Heat delivery</h2>
+          <p class="hint">
+            The derivative of the gas-meter reading gives instantaneous heating
+            power, which is much more accurate than treating heating as a binary
+            on/off signal. This also carries over when you switch to a heat
+            pump with an electricity meter × COP.
+          </p>
+          <div class="params-grid">
+            ${this._paramCard(
+              "Current heat delivered",
+              this._fix(d.heat_power_w, 0),
+              "W",
+              kw >= 1
+                ? `≈ ${this._fix(kw, 2)} kW right now.`
+                : "Low or idle — waiting for the boiler to fire."
+            )}
+            ${this._paramCard(
+              "Gas meter",
+              d.gas_meter_sensor
+                ? this._escape(d.gas_meter_sensor)
+                : "—",
+              "",
+              "Cumulative gas consumption (m³)"
+            )}
+            ${this._paramCard(
+              "Boiler efficiency",
+              this._fix(d.boiler_efficiency, 2),
+              "",
+              "Fraction of gas energy that reaches the house"
+            )}
+            ${this._paramCard(
+              "Heat share",
+              this._fix(d.heat_share, 2),
+              "",
+              "Fraction of boiler heat attributed to this room"
+            )}
+          </div>
+        </div>
+      `;
+    }
+
+    // ── Nudge history (zone setpoint decisions) ──
+    const nudges = Array.isArray(d.nudge_history) ? d.nudge_history : [];
+    if (nudges.length > 0) {
+      const reasonLabels = {
+        initial: { icon: "mdi:play", label: "Initial setpoint" },
+        nudge_up_room_cold: { icon: "mdi:arrow-up-bold", label: "Nudged up — room cold" },
+        nudge_down_overshoot: { icon: "mdi:arrow-down-bold", label: "Nudged down — overshoot" },
+        drift_back_to_target: { icon: "mdi:arrow-down", label: "Drifting back to target" },
+        hold_at_target: { icon: "mdi:pause", label: "Holding at target" },
+      };
+      const rows = nudges
+        .slice()
+        .reverse()
+        .slice(0, 20)
+        .map((n) => {
+          const info = reasonLabels[n.reason] || {
+            icon: "mdi:information-outline",
+            label: n.reason || "—",
+          };
+          const ts = n.timestamp
+            ? new Date(this._num(n.timestamp, 0) * 1000).toLocaleString()
+            : "—";
+          return `<li class="nudge-item">
+            <ha-icon icon="${info.icon}"></ha-icon>
+            <div class="nudge-main">
+              <div class="nudge-title">${this._escape(info.label)}
+                <span class="nudge-sp">→ ${this._fmt(n.setpoint, " °C")}</span>
+              </div>
+              <div class="nudge-meta">
+                ${this._escape(ts)}
+                ${n.leader ? ` · leader: <strong>${this._escape(n.leader)}</strong>` : ""}
+                ${n.target != null ? ` · target ${this._fmt(n.target, "°")}` : ""}
+                ${n.current != null ? ` · indoor ${this._fmt(n.current, "°")}` : ""}
+              </div>
+            </div>
+          </li>`;
+        })
+        .join("");
+      detail.innerHTML += `
+        <div class="section">
+          <h2><ha-icon icon="mdi:history"></ha-icon>Setpoint nudge history</h2>
+          <p class="hint">
+            Recent decisions by the zone controller. Small setpoint offsets
+            (≤1 °C) preserve OpenTherm modulation so the boiler/heat pump keeps
+            its efficient flow temperature.
+          </p>
+          <ul class="nudge-list">${rows}</ul>
+        </div>
+      `;
+    }
+
     // ── Solar diagnostics ──
-    if (d.solar_calc) {
-      const sc = d.solar_calc;
-      const absorbed = (sc.ghi_w_m2 * d.params.solar_gain_factor).toFixed(0);
+    if (solar) {
+      const sc = solar;
+      const sgf = this._num(params.solar_gain_factor, 0);
+      const ghi = this._num(sc.ghi_w_m2, 0);
+      const absorbed = (ghi * sgf).toFixed(0);
       detail.innerHTML += `
         <div class="section">
           <h2><ha-icon icon="mdi:weather-sunny"></ha-icon>Solar irradiance</h2>
@@ -545,47 +982,39 @@ class PredictiveHeatingPanel extends HTMLElement {
           <div class="solar-grid">
             <div class="solar-block">
               <div class="solar-label">Sun elevation</div>
-              <div class="solar-value">${
-                sc.sun_elevation_deg != null ? sc.sun_elevation_deg.toFixed(1) + "°" : "—"
-              }</div>
+              <div class="solar-value">${this._fix(sc.sun_elevation_deg, 1)}°</div>
             </div>
             <div class="solar-block">
               <div class="solar-label">Sun azimuth</div>
-              <div class="solar-value">${
-                sc.sun_azimuth_deg != null ? sc.sun_azimuth_deg.toFixed(1) + "°" : "—"
-              }</div>
+              <div class="solar-value">${this._fix(sc.sun_azimuth_deg, 1)}°</div>
             </div>
             <div class="solar-block">
               <div class="solar-label">Weather entity</div>
-              <div class="solar-value mono">${sc.weather_entity || "—"}</div>
+              <div class="solar-value mono">${this._escape(sc.weather_entity || "—")}</div>
             </div>
             <div class="solar-block">
               <div class="solar-label">Condition</div>
-              <div class="solar-value">${sc.weather_condition || "—"}</div>
+              <div class="solar-value">${this._escape(sc.weather_condition || "—")}</div>
             </div>
             <div class="solar-block">
               <div class="solar-label">Cloud cover</div>
-              <div class="solar-value">${
-                sc.cloud_coverage_pct != null
-                  ? sc.cloud_coverage_pct.toFixed(0) + " %"
-                  : "—"
-              }</div>
-              <div class="solar-sublabel">from ${sc.cloud_source}</div>
+              <div class="solar-value">${this._fix(sc.cloud_coverage_pct, 0)} %</div>
+              <div class="solar-sublabel">from ${this._escape(sc.cloud_source || "—")}</div>
             </div>
             <div class="solar-block">
               <div class="solar-label">Clear-sky GHI</div>
-              <div class="solar-value">${sc.ghi_clear_sky_w_m2.toFixed(0)} W/m²</div>
+              <div class="solar-value">${this._fix(sc.ghi_clear_sky_w_m2, 0)} W/m²</div>
               <div class="solar-sublabel">Haurwitz model · cos(elevation)</div>
             </div>
             <div class="solar-block highlight">
               <div class="solar-label">Adjusted GHI</div>
-              <div class="solar-value">${sc.ghi_w_m2.toFixed(0)} W/m²</div>
-              <div class="solar-sublabel">× (1 − 0.75·cloud<sup>3.4</sup>) = factor ${sc.cloud_factor}</div>
+              <div class="solar-value">${this._fix(sc.ghi_w_m2, 0)} W/m²</div>
+              <div class="solar-sublabel">× (1 − 0.75·cloud<sup>3.4</sup>) = factor ${this._escape(String(sc.cloud_factor ?? "—"))}</div>
             </div>
             <div class="solar-block highlight">
               <div class="solar-label">Heat absorbed by room</div>
               <div class="solar-value">~${absorbed} W</div>
-              <div class="solar-sublabel">GHI × gain factor (${d.params.solar_gain_factor.toFixed(2)})</div>
+              <div class="solar-sublabel">GHI × gain factor (${this._fix(sgf, 2)})</div>
             </div>
           </div>
         </div>
@@ -593,9 +1022,13 @@ class PredictiveHeatingPanel extends HTMLElement {
     }
 
     // ── Training Progress ──
-    const progressPct = Math.min(100, d.learning_progress || 0);
-    const idlePct = Math.min(100, (d.idle_samples / d.min_idle) * 100);
-    const activePct = Math.min(100, (d.active_samples / d.min_active) * 100);
+    const progressPct = Math.min(100, this._num(d.learning_progress, 0));
+    const minIdle = this._num(d.min_idle, 1);
+    const minActive = this._num(d.min_active, 1);
+    const idleSamples = this._num(d.idle_samples, 0);
+    const activeSamples = this._num(d.active_samples, 0);
+    const idlePct = Math.min(100, (idleSamples / (minIdle || 1)) * 100);
+    const activePct = Math.min(100, (activeSamples / (minActive || 1)) * 100);
     const stateColor =
       d.model_state === "calibrated"
         ? "var(--success-color, #4caf50)"
@@ -635,7 +1068,7 @@ class PredictiveHeatingPanel extends HTMLElement {
             <div class="sample-bar-group">
               <div class="sample-bar-header">
                 <span>Idle observations</span>
-                <span>${d.idle_samples} / ${d.min_idle}</span>
+                <span>${idleSamples} / ${minIdle}</span>
               </div>
               <div class="progress-bar large">
                 <div class="progress-fill" style="width:${idlePct}%;background:var(--info-color, var(--primary-color))"></div>
@@ -645,7 +1078,7 @@ class PredictiveHeatingPanel extends HTMLElement {
             <div class="sample-bar-group">
               <div class="sample-bar-header">
                 <span>Active observations</span>
-                <span>${d.active_samples} / ${d.min_active}</span>
+                <span>${activeSamples} / ${minActive}</span>
               </div>
               <div class="progress-bar large">
                 <div class="progress-fill" style="width:${activePct}%;background:var(--accent-color, #ff9800)"></div>
@@ -698,24 +1131,24 @@ class PredictiveHeatingPanel extends HTMLElement {
     }
 
     // ── Predictions ──
-    if (d.model_state === "calibrated" && d.predictions) {
+    if (d.model_state === "calibrated" && predictions) {
       detail.innerHTML += `
         <div class="section">
           <h2><ha-icon icon="mdi:crystal-ball"></ha-icon>Predictions</h2>
           <div class="predictions-grid">
             <div class="prediction-card">
               <div class="prediction-label">Temp in 1 h (heating off)</div>
-              <div class="prediction-value">${this._fmt(d.predictions.temp_1h_off, "°C")}</div>
+              <div class="prediction-value">${this._fmt(predictions.temp_1h_off, "°C")}</div>
             </div>
             <div class="prediction-card">
               <div class="prediction-label">Temp in 1 h (heating on)</div>
-              <div class="prediction-value">${this._fmt(d.predictions.temp_1h_on, "°C")}</div>
+              <div class="prediction-value">${this._fmt(predictions.temp_1h_on, "°C")}</div>
             </div>
             <div class="prediction-card">
               <div class="prediction-label">Time to reach target</div>
               <div class="prediction-value">${
-                d.predictions.time_to_target != null
-                  ? d.predictions.time_to_target.toFixed(0) + " min"
+                predictions.time_to_target != null
+                  ? this._fix(predictions.time_to_target, 0) + " min"
                   : "N/A"
               }</div>
             </div>
@@ -755,7 +1188,25 @@ class PredictiveHeatingPanel extends HTMLElement {
   }
 
   _fmt(v, suffix = "") {
-    return v == null ? "—" : v.toFixed(1) + suffix;
+    if (v == null || Number.isNaN(v)) return "—";
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "—";
+    return n.toFixed(1) + suffix;
+  }
+
+  // Formats a number with N decimals, or returns a placeholder.
+  // Never throws, never produces NaN or "undefined".
+  _fix(v, decimals = 1, fallback = "—") {
+    if (v == null || Number.isNaN(v)) return fallback;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return n.toFixed(decimals);
+  }
+
+  _num(v, fallback = 0) {
+    if (v == null) return fallback;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
   }
 
   // ─── Canvas charts ────────────────────────────────────────
@@ -1636,6 +2087,324 @@ class PredictiveHeatingPanel extends HTMLElement {
         background: color-mix(in srgb, var(--error-color, #f44336) 12%, transparent);
       }
 
+      /* ── Inline controls (card + detail) ───────────────── */
+      .target-block { gap: 4px; }
+      .target-controls {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .step-btn {
+        width: 26px;
+        height: 26px;
+        border: 1px solid var(--divider-color, rgba(0,0,0,0.15));
+        background: var(--card-background-color, white);
+        color: var(--primary-text-color);
+        border-radius: 50%;
+        font-size: 18px;
+        line-height: 1;
+        cursor: pointer;
+        transition: background-color 0.15s, transform 0.1s;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+      }
+      .step-btn:hover {
+        background: color-mix(in srgb, var(--primary-color) 12%, transparent);
+      }
+      .step-btn:active { transform: scale(0.95); }
+
+      .preset-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin: 4px 0 12px;
+      }
+      .preset-chip {
+        padding: 4px 12px;
+        font-size: 12px;
+        font-weight: 500;
+        border-radius: 14px;
+        border: 1px solid var(--divider-color, rgba(0,0,0,0.15));
+        background: var(--secondary-background-color, rgba(0,0,0,0.03));
+        color: var(--secondary-text-color);
+        cursor: pointer;
+        text-transform: capitalize;
+        transition: background-color 0.15s, color 0.15s;
+      }
+      .preset-chip:hover {
+        background: color-mix(in srgb, var(--primary-color) 10%, transparent);
+        color: var(--primary-text-color);
+      }
+      .preset-chip.active {
+        background: var(--primary-color);
+        color: var(--text-primary-color, white);
+        border-color: var(--primary-color);
+      }
+
+      .status-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 4px;
+        margin-bottom: 10px;
+      }
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 3px 8px;
+        font-size: 11px;
+        border-radius: 10px;
+        background: var(--secondary-background-color, rgba(0,0,0,0.04));
+        color: var(--secondary-text-color);
+      }
+      .chip.mono { font-family: var(--code-font-family, monospace); font-size: 10px; }
+      .chip ha-icon { --mdc-icon-size: 12px; }
+      .chip.schedule.on { color: var(--success-color, #4caf50); }
+      .chip.schedule.off { color: var(--secondary-text-color); }
+
+      .window-banner {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px;
+        margin-bottom: 12px;
+        font-size: 12px;
+        background: color-mix(in srgb, var(--warning-color, #ff9800) 12%, transparent);
+        border-left: 3px solid var(--warning-color, #ff9800);
+        border-radius: 4px;
+        color: var(--primary-text-color);
+      }
+      .window-banner ha-icon {
+        --mdc-icon-size: 16px;
+        color: var(--warning-color, #ff9800);
+      }
+      .room-card.is-window-open {
+        border-color: var(--warning-color, #ff9800);
+      }
+
+      /* ── Detail: big controls ──────────────────────────── */
+      .controls-section .hint { margin-bottom: 14px; }
+      .big-target {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        margin: 12px 0 14px;
+      }
+      .big-step-btn {
+        width: 48px;
+        height: 48px;
+        border: 1px solid var(--divider-color, rgba(0,0,0,0.15));
+        background: var(--card-background-color, white);
+        color: var(--primary-text-color);
+        border-radius: 50%;
+        font-size: 28px;
+        line-height: 1;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        transition: background-color 0.15s, transform 0.1s;
+      }
+      .big-step-btn:hover {
+        background: color-mix(in srgb, var(--primary-color) 15%, transparent);
+      }
+      .big-step-btn:active { transform: scale(0.95); }
+      .big-target-value {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        min-width: 120px;
+      }
+      .big-target-number {
+        font-size: 44px;
+        font-weight: 500;
+        line-height: 1;
+        color: var(--primary-color);
+      }
+      .big-target-unit {
+        font-size: 12px;
+        color: var(--secondary-text-color);
+        margin-top: 4px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .kv.subtle {
+        border-bottom: none;
+        font-size: 12px;
+        color: var(--secondary-text-color);
+        margin-top: 8px;
+      }
+      .kv .mono { font-family: var(--code-font-family, monospace); font-size: 12px; }
+
+      /* ── Detail: schedule section ──────────────────────── */
+      .schedule-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 10px;
+      }
+      .schedule-block {
+        background: var(--secondary-background-color, rgba(0,0,0,0.03));
+        border-radius: 8px;
+        padding: 12px;
+      }
+      .schedule-block.highlight {
+        background: color-mix(in srgb, var(--primary-color) 10%, transparent);
+        border-left: 3px solid var(--primary-color);
+      }
+      .schedule-block.on { border-left: 3px solid var(--success-color, #4caf50); }
+      .schedule-block.off { border-left: 3px solid var(--secondary-text-color); }
+      .schedule-label {
+        font-size: 11px;
+        color: var(--secondary-text-color);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .schedule-value {
+        font-size: 16px;
+        font-weight: 500;
+        margin-top: 4px;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .schedule-value.mono {
+        font-family: var(--code-font-family, monospace);
+        font-size: 12px;
+      }
+      .schedule-value ha-icon { --mdc-icon-size: 18px; }
+      .schedule-sublabel {
+        font-size: 11px;
+        color: var(--secondary-text-color);
+        margin-top: 4px;
+      }
+
+      /* ── Detail: window section ────────────────────────── */
+      .window-section.open h2 ha-icon {
+        color: var(--warning-color, #ff9800);
+      }
+      .window-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .window-item {
+        display: grid;
+        grid-template-columns: auto 1fr auto auto;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 12px;
+        background: var(--secondary-background-color, rgba(0,0,0,0.03));
+        border-radius: 8px;
+        font-size: 13px;
+      }
+      .window-item.open {
+        background: color-mix(in srgb, var(--warning-color, #ff9800) 12%, transparent);
+      }
+      .window-item ha-icon { --mdc-icon-size: 20px; }
+      .window-item.open ha-icon { color: var(--warning-color, #ff9800); }
+      .window-state {
+        text-transform: uppercase;
+        font-size: 11px;
+        padding: 2px 8px;
+        border-radius: 10px;
+        background: var(--divider-color, rgba(0,0,0,0.08));
+      }
+      .window-item.open .window-state {
+        background: var(--warning-color, #ff9800);
+        color: white;
+      }
+      .window-friendly {
+        font-size: 12px;
+        color: var(--secondary-text-color);
+      }
+      .empty-inline {
+        color: var(--secondary-text-color);
+        font-size: 13px;
+        margin: 0;
+      }
+
+      /* ── Detail: nudge history ─────────────────────────── */
+      .nudge-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .nudge-item {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        align-items: start;
+        gap: 10px;
+        padding: 8px 10px;
+        background: var(--secondary-background-color, rgba(0,0,0,0.03));
+        border-radius: 6px;
+      }
+      .nudge-item > ha-icon {
+        --mdc-icon-size: 18px;
+        color: var(--primary-color);
+        margin-top: 2px;
+      }
+      .nudge-main { display: flex; flex-direction: column; gap: 2px; }
+      .nudge-title {
+        font-size: 13px;
+        font-weight: 500;
+      }
+      .nudge-sp {
+        font-weight: 400;
+        color: var(--primary-color);
+        margin-left: 6px;
+      }
+      .nudge-meta {
+        font-size: 11px;
+        color: var(--secondary-text-color);
+      }
+
+      /* ── Detail: error fallback ────────────────────────── */
+      .error-section h2 ha-icon { color: var(--error-color, #f44336); }
+      .error-detail {
+        background: var(--secondary-background-color, rgba(0,0,0,0.04));
+        padding: 10px 12px;
+        border-radius: 6px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 12px;
+        font-family: var(--code-font-family, monospace);
+        color: var(--error-color, #f44336);
+        margin: 8px 0 16px;
+      }
+      .error-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .primary-btn, .secondary-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 16px;
+        border-radius: 18px;
+        font-size: 13px;
+        cursor: pointer;
+        border: 1px solid transparent;
+      }
+      .primary-btn {
+        background: var(--primary-color);
+        color: var(--text-primary-color, white);
+        border-color: var(--primary-color);
+      }
+      .secondary-btn {
+        background: transparent;
+        color: var(--primary-text-color);
+        border-color: var(--divider-color, rgba(0,0,0,0.15));
+      }
+      .primary-btn ha-icon, .secondary-btn ha-icon { --mdc-icon-size: 16px; }
+
       /* Responsive */
       @media (max-width: 600px) {
         .container { padding: 12px; }
@@ -1644,6 +2413,9 @@ class PredictiveHeatingPanel extends HTMLElement {
         .params-grid { grid-template-columns: 1fr; }
         .training-overall { flex-direction: column; text-align: center; }
         .solar-grid { grid-template-columns: 1fr 1fr; }
+        .schedule-grid { grid-template-columns: 1fr 1fr; }
+        .big-target-number { font-size: 36px; }
+        .big-step-btn { width: 44px; height: 44px; font-size: 24px; }
       }
     `;
   }

@@ -99,6 +99,9 @@ class HeatingZone:
         self._is_heating = False
         self._last_setpoint: float | None = None
         self._last_setpoint_time: float = 0.0
+        # Rolling log of the last few setpoint decisions so the dashboard
+        # can show *why* the controller is doing what it's doing.
+        self.nudge_history: list[dict] = []
 
     # ── room registration / updates ──────────────────────────────
 
@@ -225,7 +228,14 @@ class HeatingZone:
         # First time: start at the room's target.
         if self._last_setpoint is None:
             setpoint = self._clamp_setpoint(target, target)
-            self._commit_setpoint(setpoint, now=now)
+            self._commit_setpoint(
+                setpoint,
+                now=now,
+                reason="initial",
+                leader=leader.room_name,
+                target=target,
+                current=current,
+            )
             return setpoint
 
         # Respect the minimum interval between nudges so the boiler has
@@ -239,9 +249,11 @@ class HeatingZone:
         if deviation > NUDGE_COLD_BAND:
             # Room is persistently cold — nudge up.
             new_setpoint = self._clamp_setpoint(prev + step, target)
+            reason = "nudge_up_room_cold"
         elif deviation < -NUDGE_WARM_BAND:
             # Room is overshooting — nudge down.
             new_setpoint = self._clamp_setpoint(prev - step, target)
+            reason = "nudge_down_overshoot"
         else:
             # In deadband. Drift back toward target so we don't leave
             # the setpoint stuck at +1°C forever.
@@ -249,20 +261,50 @@ class HeatingZone:
                 new_setpoint = self._clamp_setpoint(
                     max(target, prev - step), target
                 )
+                reason = "drift_back_to_target"
             else:
                 new_setpoint = target
+                reason = "hold_at_target"
 
         # Only report a change if the setpoint actually moved.
         if abs(new_setpoint - prev) < 0.05:
             return None
 
-        self._commit_setpoint(new_setpoint, now=now)
+        self._commit_setpoint(
+            new_setpoint,
+            now=now,
+            reason=reason,
+            leader=leader.room_name,
+            target=target,
+            current=current,
+        )
         return new_setpoint
 
-    def _commit_setpoint(self, setpoint: float, now: float | None = None) -> None:
+    def _commit_setpoint(
+        self,
+        setpoint: float,
+        now: float | None = None,
+        *,
+        reason: str = "",
+        leader: str | None = None,
+        target: float | None = None,
+        current: float | None = None,
+    ) -> None:
         rounded = round(setpoint, 1)
         self._last_setpoint = rounded
         self._last_setpoint_time = now if now is not None else time.time()
+        self.nudge_history.append(
+            {
+                "timestamp": self._last_setpoint_time,
+                "setpoint": rounded,
+                "reason": reason,
+                "leader": leader,
+                "target": target,
+                "current": current,
+            }
+        )
+        if len(self.nudge_history) > 100:
+            self.nudge_history = self.nudge_history[-100:]
 
     # Used by the climate entity when the user turns the whole room off,
     # so the next "on" transition starts nudging from target again.

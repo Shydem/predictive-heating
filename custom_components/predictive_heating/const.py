@@ -23,6 +23,14 @@ CONF_HEAT_SHARE = "heat_share"
 CONF_NUDGE_STEP = "nudge_step"
 CONF_NUDGE_INTERVAL_MIN = "nudge_interval_min"
 
+# Schedule support — the user points us at a `schedule.*` entity and
+# we follow its on/off state. When the schedule is ON the room target
+# is set to the configured "schedule on temp" (defaults to comfort),
+# when OFF to the "schedule off temp" (defaults to eco).
+CONF_SCHEDULE_ENTITY = "schedule_entity"
+CONF_SCHEDULE_ON_TEMP = "schedule_on_temp"
+CONF_SCHEDULE_OFF_TEMP = "schedule_off_temp"
+
 # Room-size / building-type bootstrap (v0.2 ROADMAP item)
 CONF_FLOOR_AREA_M2 = "floor_area_m2"
 CONF_CEILING_HEIGHT_M = "ceiling_height_m"

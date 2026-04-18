@@ -29,6 +29,9 @@ from .const import (
     CONF_NUDGE_STEP,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
     CONF_ROOM_NAME,
+    CONF_SCHEDULE_ENTITY,
+    CONF_SCHEDULE_OFF_TEMP,
+    CONF_SCHEDULE_ON_TEMP,
     CONF_TEMPERATURE_SENSOR,
     CONF_WINDOW_SENSORS,
     DEFAULT_BOILER_EFFICIENCY,
@@ -157,6 +160,9 @@ class PredictiveHeatingConfigFlow(
                         options=_BUILDING_TYPE_OPTIONS,
                         mode=selector.SelectSelectorMode.DROPDOWN,
                     )
+                ),
+                vol.Optional(CONF_SCHEDULE_ENTITY): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="schedule")
                 ),
             }
         )
@@ -331,6 +337,43 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                 selector.NumberSelectorConfig(
                     min=20.0, max=45.0, step=0.01,
                     unit_of_measurement="MJ/m³",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            # ── Schedule (optional) ─────────────────────────────
+            vol.Optional(
+                CONF_SCHEDULE_ENTITY,
+                default=(
+                    options.get(CONF_SCHEDULE_ENTITY)
+                    or data.get(CONF_SCHEDULE_ENTITY)
+                    or vol.UNDEFINED
+                ),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="schedule")
+            ),
+            vol.Optional(
+                CONF_SCHEDULE_ON_TEMP,
+                default=options.get(
+                    CONF_SCHEDULE_ON_TEMP,
+                    options.get("comfort_temp", DEFAULT_COMFORT_TEMP),
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=5.0, max=30.0, step=0.5,
+                    unit_of_measurement="°C",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_SCHEDULE_OFF_TEMP,
+                default=options.get(
+                    CONF_SCHEDULE_OFF_TEMP,
+                    options.get("eco_temp", DEFAULT_ECO_TEMP),
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=5.0, max=30.0, step=0.5,
+                    unit_of_measurement="°C",
                     mode=selector.NumberSelectorMode.BOX,
                 )
             ),
