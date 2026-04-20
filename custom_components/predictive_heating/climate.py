@@ -653,10 +653,22 @@ class PredictiveHeatingClimate(ClimateEntity):
         """Expose thermal model and zone state as attributes."""
         attrs = {
             "thermal_model_state": self._model.state,
-            "heat_loss_coefficient": round(self._model.params.heat_loss_coeff, 1),
-            "thermal_mass_kj": round(self._model.params.thermal_mass, 0),
-            "heating_power": round(self._model.params.heating_power, 0),
-            "solar_gain_factor": round(self._model.params.solar_gain_factor, 3),
+            "heat_loss_coefficient": (
+                round(self._model.params.heat_loss_coeff, 1)
+                if self._model.params.heat_loss_coeff is not None else None
+            ),
+            "thermal_mass_kj": (
+                round(self._model.params.thermal_mass, 0)
+                if self._model.params.thermal_mass is not None else None
+            ),
+            "heating_power": (
+                round(self._model.params.heating_power, 0)
+                if self._model.params.heating_power is not None else None
+            ),
+            "solar_gain_factor": (
+                round(self._model.params.solar_gain_factor, 3)
+                if self._model.params.solar_gain_factor is not None else None
+            ),
             "idle_samples": self._model.idle_count,
             "active_samples": self._model.active_count,
             "total_updates": self._model.total_updates,

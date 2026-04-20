@@ -455,7 +455,14 @@ class ThermalModel:
             "active_count": self.active_count,
             "total_updates": self.total_updates,
             "state": self.state,
-            "mean_prediction_error": self.mean_prediction_error,
+            # JSON cannot represent float("inf") — store as None and restore
+            # to float("inf") on load. This prevents json.dumps from either
+            # raising or producing "Infinity" which json.loads rejects.
+            "mean_prediction_error": (
+                None
+                if self.mean_prediction_error == float("inf")
+                else self.mean_prediction_error
+            ),
             "_h_over_c_sum": self._h_over_c_sum,
             "_h_over_c_count": self._h_over_c_count,
             "_measured_power_count": self._measured_power_count,
@@ -481,11 +488,21 @@ class ThermalModel:
         # Restore params
         if "params" in data:
             p = data["params"]
+            # Use `or default` so a stored null/None/0 for any param falls
+            # back gracefully to the default rather than propagating None.
             model.params = ThermalParameters(
-                heat_loss_coeff=p.get("heat_loss_coeff", DEFAULT_HEAT_LOSS_COEFFICIENT),
-                thermal_mass=p.get("thermal_mass", DEFAULT_THERMAL_MASS),
-                heating_power=p.get("heating_power", DEFAULT_HEATING_POWER),
-                solar_gain_factor=p.get("solar_gain_factor", DEFAULT_SOLAR_GAIN_FACTOR),
+                heat_loss_coeff=float(
+                    p.get("heat_loss_coeff") or DEFAULT_HEAT_LOSS_COEFFICIENT
+                ),
+                thermal_mass=float(
+                    p.get("thermal_mass") or DEFAULT_THERMAL_MASS
+                ),
+                heating_power=float(
+                    p.get("heating_power") or DEFAULT_HEATING_POWER
+                ),
+                solar_gain_factor=float(
+                    p.get("solar_gain_factor") or DEFAULT_SOLAR_GAIN_FACTOR
+                ),
             )
         else:
             model.params = ThermalParameters()
@@ -494,7 +511,9 @@ class ThermalModel:
         model.active_count = data.get("active_count", 0)
         model.total_updates = data.get("total_updates", 0)
         model.state = data.get("state", STATE_LEARNING)
-        model.mean_prediction_error = data.get("mean_prediction_error", float("inf"))
+        # None is stored when the value was float("inf") — restore that.
+        _mpe = data.get("mean_prediction_error")
+        model.mean_prediction_error = float("inf") if _mpe is None else float(_mpe)
         model._h_over_c_sum = data.get("_h_over_c_sum", 0.0)
         model._h_over_c_count = data.get("_h_over_c_count", 0)
         model._measured_power_count = data.get("_measured_power_count", 0)

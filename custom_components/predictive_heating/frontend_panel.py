@@ -23,6 +23,7 @@ from homeassistant.components.frontend import (
 )
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 
 from .const import (
     CONF_ROOM_NAME,
@@ -85,6 +86,31 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_set_preset)
 
     _LOGGER.info("Predictive Heating dashboard registered at sidebar")
+
+
+def _resolve_climate_entity_id(
+    hass: HomeAssistant, entry_id: str, data: dict
+) -> str | None:
+    """Return the climate entity_id for a room entry.
+
+    First tries the in-memory shortcut set by async_added_to_hass.
+    Falls back to the entity registry lookup using the known unique_id
+    pattern — this covers the brief window after a reload where the
+    entity exists in the registry but async_added_to_hass hasn't fired
+    yet (and therefore hasn't written climate_entity_id into domain data).
+    """
+    entity_id = data.get("climate_entity_id")
+    if entity_id:
+        return entity_id
+
+    # Registry fallback: unique_id is set in PredictiveHeatingClimate.__init__
+    unique_id = f"predictive_heating_{entry_id}"
+    ent_reg = er.async_get(hass)
+    entity_id = ent_reg.async_get_entity_id("climate", DOMAIN, unique_id)
+    if entity_id:
+        # Cache for next call so we don't hit the registry every time.
+        data["climate_entity_id"] = entity_id
+    return entity_id
 
 
 def _safe_float(value) -> float | None:
@@ -237,7 +263,8 @@ def _build_room_overview(
     model = data.get("model")
     config = data.get("config", {})
     # Use the entity_id our climate entity registered (rename-safe).
-    climate_entity_id = data.get("climate_entity_id")
+    # Falls back to entity registry if async_added_to_hass hasn't fired yet.
+    climate_entity_id = _resolve_climate_entity_id(hass, entry_id, data)
 
     current_temp = None
     target_temp = None
@@ -398,7 +425,7 @@ def _build_room_detail(
     boiler_efficiency = None
     heat_share = None
 
-    climate_entity_id = data.get("climate_entity_id")
+    climate_entity_id = _resolve_climate_entity_id(hass, entry_id, data)
     state = (
         hass.states.get(climate_entity_id) if climate_entity_id else None
     )
@@ -534,9 +561,12 @@ def _build_room_detail(
     window = _room_window_state(hass, config)
     schedule = _schedule_state(hass, config)
 
-    mean_err = getattr(model, "mean_prediction_error", float("inf"))
+    mean_err = getattr(model, "mean_prediction_error", None)
+    # Guard: None or inf (not yet learned) → display as None
     mean_err_out = (
-        round(mean_err, 3) if mean_err != float("inf") else None
+        round(mean_err, 3)
+        if (mean_err is not None and mean_err != float("inf"))
+        else None
     )
 
     return {
@@ -648,11 +678,12 @@ async def ws_set_temperature(
     msg: dict,
 ) -> None:
     """Set the target temperature for a room from the dashboard."""
-    data = hass.data.get(DOMAIN, {}).get(msg["entry_id"])
+    entry_id = msg["entry_id"]
+    data = hass.data.get(DOMAIN, {}).get(entry_id)
     if not data:
         connection.send_error(msg["id"], "not_found", "Room not found")
         return
-    climate_entity_id = data.get("climate_entity_id")
+    climate_entity_id = _resolve_climate_entity_id(hass, entry_id, data)
     if not climate_entity_id:
         connection.send_error(
             msg["id"],
@@ -694,11 +725,12 @@ async def ws_set_preset(
     msg: dict,
 ) -> None:
     """Set the preset mode for a room from the dashboard."""
-    data = hass.data.get(DOMAIN, {}).get(msg["entry_id"])
+    entry_id = msg["entry_id"]
+    data = hass.data.get(DOMAIN, {}).get(entry_id)
     if not data:
         connection.send_error(msg["id"], "not_found", "Room not found")
         return
-    climate_entity_id = data.get("climate_entity_id")
+    climate_entity_id = _resolve_climate_entity_id(hass, entry_id, data)
     if not climate_entity_id:
         connection.send_error(
             msg["id"],

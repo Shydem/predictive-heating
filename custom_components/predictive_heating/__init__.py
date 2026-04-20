@@ -137,9 +137,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         room_name=entry.data.get(CONF_ROOM_NAME, entry.title),
     )
 
+    # Merge options over data so the frontend panel and any code that reads
+    # data["config"] sees the full effective configuration, including options
+    # that were set after initial setup (window sensors, schedule, gas meter…).
+    merged_config = {**dict(entry.data), **dict(entry.options)}
+
     hass.data[DOMAIN][entry.entry_id] = {
         "model": model,
-        "config": dict(entry.data),
+        "config": merged_config,
         "zone": zone,
         "store": store,
     }
