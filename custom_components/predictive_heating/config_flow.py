@@ -203,6 +203,8 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
     ) -> config_entries.ConfigFlowResult:
         """Manage room name, temperature presets, and setpoint limits."""
         # Fields that live on entry.data (room identity), not in options.
+        # Everything else (window sensors, gas sensor, temps…) goes to options
+        # so the user can reconfigure without removing and re-adding the room.
         _DATA_FIELDS = (
             CONF_ROOM_NAME,
             CONF_FLOOR_AREA_M2,
@@ -291,6 +293,19 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                 selector.NumberSelectorConfig(
                     min=2, max=60, step=1, unit_of_measurement="min",
                     mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_WINDOW_SENSORS,
+                default=(
+                    options.get(CONF_WINDOW_SENSORS)
+                    or data.get(CONF_WINDOW_SENSORS)
+                    or vol.UNDEFINED
+                ),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain="binary_sensor",
+                    multiple=True,
                 )
             ),
             vol.Optional(

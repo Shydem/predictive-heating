@@ -151,6 +151,11 @@ class ThermalModel:
     # round-trip carries it across restarts without requiring a
     # homeassistant dependency at module level.
     _heat_source_state: dict | None = None
+    # Rolling average of measured heat power (W) from gas/heat-pump meter.
+    # When a meter is available this is more informative than EKF's P_heat,
+    # which is intentionally frozen (dh/dP=0) when measured_heat_w is given.
+    _measured_power_sum: float = 0.0
+    _measured_power_count: int = 0
 
     def __post_init__(self):
         if HAS_NUMPY and self._ekf is None:
@@ -254,9 +259,31 @@ class ThermalModel:
             ekf_state = self._ekf.state
             self.params.heat_loss_coeff = ekf_state.H
             self.params.thermal_mass = ekf_state.C_kj
-            self.params.heating_power = ekf_state.P_heat
             self.params.solar_gain_factor = ekf_state.S_gain
             self.mean_prediction_error = self._ekf.mean_prediction_error
+
+            # heating_power: prefer the rolling average of directly-measured
+            # watts (gas meter / heat-pump meter) over the EKF's P_heat.
+            # When measured_heat_w is provided, EKF intentionally freezes
+            # P_heat (dh/dP=0), so it stays at its initial 5 kW default —
+            # meaningless as a display value.
+            if prev.heat_power_w is not None and prev.heat_power_w > 0:
+                # Exponential moving average α≈0.05 → ~20-sample window.
+                # Only update while the boiler was actually delivering heat,
+                # so domestic-hot-water spikes and true heating get averaged
+                # together naturally.
+                alpha = 0.05
+                if self._measured_power_count == 0:
+                    self.params.heating_power = prev.heat_power_w
+                else:
+                    self.params.heating_power = (
+                        (1 - alpha) * self.params.heating_power
+                        + alpha * prev.heat_power_w
+                    )
+                self._measured_power_count += 1
+            else:
+                # No meter: use the EKF's learned P_heat.
+                self.params.heating_power = ekf_state.P_heat
 
             # Track H evolution
             self.h_history.append(
@@ -431,6 +458,7 @@ class ThermalModel:
             "mean_prediction_error": self.mean_prediction_error,
             "_h_over_c_sum": self._h_over_c_sum,
             "_h_over_c_count": self._h_over_c_count,
+            "_measured_power_count": self._measured_power_count,
             "observations": obs_list,
             "h_history": self.h_history[-300:],
             "prediction_error_history": self.prediction_error_history[-200:],
@@ -469,6 +497,8 @@ class ThermalModel:
         model.mean_prediction_error = data.get("mean_prediction_error", float("inf"))
         model._h_over_c_sum = data.get("_h_over_c_sum", 0.0)
         model._h_over_c_count = data.get("_h_over_c_count", 0)
+        model._measured_power_count = data.get("_measured_power_count", 0)
+        model._measured_power_sum = 0.0  # not persisted; derived from EMA in params
         model.h_history = data.get("h_history", [])
         model.prediction_error_history = data.get("prediction_error_history", [])
         model._last_obs = None

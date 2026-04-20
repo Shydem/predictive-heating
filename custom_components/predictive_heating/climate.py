@@ -136,7 +136,13 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._temp_sensor_id = config[CONF_TEMPERATURE_SENSOR]
         self._climate_entity_id = config[CONF_CLIMATE_ENTITY]
         self._outdoor_sensor_id = config.get(CONF_OUTDOOR_TEMPERATURE_SENSOR)
-        self._window_sensor_ids = config.get(CONF_WINDOW_SENSORS, [])
+        # Options win over initial data so users can add/change window sensors
+        # retroactively via the Options dialog without removing the room.
+        self._window_sensor_ids = (
+            options.get(CONF_WINDOW_SENSORS)
+            or config.get(CONF_WINDOW_SENSORS)
+            or []
+        )
 
         # Gas / heat-source (options win over data, so users can reconfigure
         # without re-adding the room).

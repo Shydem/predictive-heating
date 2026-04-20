@@ -9,36 +9,31 @@ same Honeywell T6 thermostat.
 Key responsibilities:
 - Group rooms by their shared climate entity (zone)
 - When ANY room in a zone requests heat, ALL rooms reflect "heating"
-- Gently nudge the thermostat setpoint toward a value that keeps the
-  room at target, while preserving OpenTherm modulation
+- Set the thermostat setpoint to the target temperature of the leading
+  room and leave OpenTherm to handle the modulation
 - Prevent conflicting setpoint commands to the same thermostat
 
-Setpoint strategy — gentle nudging (NOT proportional):
+Setpoint strategy — direct target (simple & OpenTherm-friendly):
 
-    Background:
-        Earlier versions boosted the setpoint proportionally to the
-        temperature error (setpoint = target + error * 1.5, capped at
-        target + 2.5°C). That guarantees overshoot on OpenTherm setups,
-        because the thermostat interprets a big (setpoint − measured)
-        gap as "run the boiler hot", and the flow temperature climbs
-        far above what's actually needed.
+    The thermostat's own built-in temperature sensor is accurate and
+    its OpenTherm modulation loop is well-tuned. Sending the exact
+    room target and letting the thermostat handle the rest is the
+    most efficient approach.
 
-    New approach:
-        - Initial setpoint = target (NOT target + boost).
-        - Re-evaluate every ``nudge_interval_min`` minutes.
-        - If the room is persistently cold (> ``cold_band`` below
-          target), nudge the setpoint UP by ``nudge_step`` (default
-          0.5°C), capped at target + ``max_setpoint_delta`` (default
-          1.0°C).
-        - If the room is overshooting (> ``warm_band`` above target),
-          nudge the setpoint DOWN by ``nudge_step``, floored at target.
-        - Otherwise, pull the setpoint gently back toward target so
-          small past boosts don't stick around.
+    Rules:
+        - When any room wants heat: setpoint = leading room's target.
+        - Only re-send the setpoint when the target changes or after a
+          minimum quiet interval (to avoid spamming OpenTherm during
+          its slow update cycle).
+        - When no room wants heat: idle the thermostat at a low value.
 
-    Why:
-        Small setpoint offsets keep the OpenTherm flow-temp curve in a
-        reasonable range, which is where the heat pump / condensing
-        boiler is most efficient.
+    Why this is better than nudging:
+        Nudging requires a fast feedback loop to work well. The
+        OpenTherm update cycle is slow (~minutes), so a nudge sent now
+        won't be visible in the room temperature for many minutes, by
+        which time the next nudge has already fired. This causes
+        instability. Setting the target directly and trusting the
+        thermostat avoids all of that.
 """
 
 from __future__ import annotations
@@ -52,8 +47,6 @@ from .const import (
     DEFAULT_NUDGE_INTERVAL_MIN,
     DEFAULT_NUDGE_STEP,
     DOMAIN,
-    NUDGE_COLD_BAND,
-    NUDGE_WARM_BAND,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -190,29 +183,21 @@ class HeatingZone:
             return float("inf")
         return now - self._last_setpoint_time
 
-    def _clamp_setpoint(self, setpoint: float, target: float) -> float:
-        """Clamp setpoint to [target, target + max_setpoint_delta]."""
-        upper = target + self.max_setpoint_delta
-        return max(target, min(setpoint, upper))
-
     def calculate_setpoint(self, now: float | None = None) -> float | None:
         """
         Return the setpoint to push to the shared thermostat, or ``None``
         if nothing should be sent right now.
 
         Rules:
-            - If no room wants heat → return None (caller will idle).
-            - First call since boot → setpoint = target. Send it.
-            - Room within the deadband (±warm_band) → pull the setpoint
-              back toward target by up to nudge_step (small correction
-              to undo past nudges), and only if ≥ nudge_interval since
-              the last change. Returns None when no change is needed.
-            - Room is cold → increase setpoint by nudge_step, once per
-              nudge_interval. Capped at target + max_setpoint_delta.
-            - Room is warm → decrease setpoint by nudge_step, once per
-              nudge_interval. Floored at target.
+            - If no room wants heat → return None (caller idles the stat).
+            - First call since boot → always send the target.
+            - Subsequent calls → only send if the target changed, or if
+              the minimum quiet interval has elapsed and the setpoint
+              differs from the current target (e.g. target was updated
+              by a schedule change).
 
-        The returned value, if any, should be sent to the thermostat.
+        The thermostat's own OpenTherm loop handles modulation; we just
+        tell it what temperature we want and leave it alone.
         """
         if not self.any_room_wants_heat:
             return None
@@ -221,64 +206,39 @@ class HeatingZone:
         if leader is None or leader.current_temp is None:
             return None
 
-        target = leader.target_temp
+        target = round(leader.target_temp, 1)
         current = leader.current_temp
-        deviation = target - current  # >0 cold, <0 warm
 
-        # First time: start at the room's target.
+        # First send since boot (or after reset): always deliver the target.
         if self._last_setpoint is None:
-            setpoint = self._clamp_setpoint(target, target)
             self._commit_setpoint(
-                setpoint,
+                target,
                 now=now,
                 reason="initial",
                 leader=leader.room_name,
                 target=target,
                 current=current,
             )
-            return setpoint
+            return target
 
-        # Respect the minimum interval between nudges so the boiler has
-        # time to react before we change our minds.
+        # Target hasn't changed → nothing to do.
+        if abs(target - self._last_setpoint) < 0.05:
+            return None
+
+        # Target changed, but respect a minimum quiet interval so we don't
+        # spam OpenTherm during its slow update cycle.
         if self._time_since_last_change(now) < self.nudge_interval_seconds:
             return None
 
-        prev = self._last_setpoint
-        step = self.nudge_step
-
-        if deviation > NUDGE_COLD_BAND:
-            # Room is persistently cold — nudge up.
-            new_setpoint = self._clamp_setpoint(prev + step, target)
-            reason = "nudge_up_room_cold"
-        elif deviation < -NUDGE_WARM_BAND:
-            # Room is overshooting — nudge down.
-            new_setpoint = self._clamp_setpoint(prev - step, target)
-            reason = "nudge_down_overshoot"
-        else:
-            # In deadband. Drift back toward target so we don't leave
-            # the setpoint stuck at +1°C forever.
-            if prev > target + 0.05:
-                new_setpoint = self._clamp_setpoint(
-                    max(target, prev - step), target
-                )
-                reason = "drift_back_to_target"
-            else:
-                new_setpoint = target
-                reason = "hold_at_target"
-
-        # Only report a change if the setpoint actually moved.
-        if abs(new_setpoint - prev) < 0.05:
-            return None
-
         self._commit_setpoint(
-            new_setpoint,
+            target,
             now=now,
-            reason=reason,
+            reason="target_changed",
             leader=leader.room_name,
             target=target,
             current=current,
         )
-        return new_setpoint
+        return target
 
     def _commit_setpoint(
         self,

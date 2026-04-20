@@ -67,12 +67,14 @@ class EKFState:
         0.04,     # S variance (0.2^2)
     ]))
 
-    # Process noise covariance (how fast parameters can drift)
+    # Process noise covariance (how fast parameters can drift).
+    # H is a physical building constant — keep its process noise very small
+    # so it doesn't drift spuriously between heating and idle periods.
     Q: np.ndarray = field(default_factory=lambda: np.diag([
-        0.01,     # H drifts very slowly
-        0.1,      # C drifts very slowly
-        0.1,      # P drifts very slowly
-        0.0001,   # S drifts very slowly
+        0.0005,   # H: near-constant building property (was 0.01 — too fast)
+        0.05,     # C: changes slowly with furniture / humidity
+        0.5,      # P: heating power can vary (boiler modulation, DHW draws)
+        0.0001,   # S: solar geometry changes slowly
     ]))
 
     # Measurement noise variance (temperature sensor noise + model mismatch)
@@ -175,11 +177,21 @@ class ThermalEKF:
         total_power = q_heat + S * I_solar - H * delta_T
 
         J = np.zeros((1, N_STATES))
-        J[0, IDX_H] = -dt / C * delta_T
+
+        # H is only identifiable when the heat input is known precisely.
+        # ‑ Idle (u_heat=0):          dT ≈ −H·ΔT/C  → H cleanly observable
+        # ‑ Heating with meter:       actual W known  → H observable
+        # ‑ Heating, no meter:        H and P_heat are fully correlated;
+        #   updating H here makes it drift up during heat and down during
+        #   idle. Freeze it instead — let P_heat absorb the error.
+        h_observable = (u_heat == 0.0) or (measured_heat_w is not None)
+        if h_observable:
+            J[0, IDX_H] = -dt / C * delta_T
+
         J[0, IDX_C] = -dt / (C * C) * total_power
         if measured_heat_w is None:
             J[0, IDX_P] = dt / C * u_heat
-        # else: dh/dP = 0, P is not updated this step
+        # else: dh/dP = 0, P is not updated when actual watts are provided
         J[0, IDX_S] = dt / C * I_solar
 
         return J
