@@ -132,6 +132,14 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._zone = zone
         self._controller = HeatingController(model)
 
+        # Fetch options up-front — several blocks below rely on options
+        # winning over the initial config entry data, so users can tweak
+        # window sensors, gas meter, schedule etc. without removing the
+        # room. The ordering here matters: referencing ``options`` before
+        # this line raises NameError and the climate entity silently
+        # fails to register.
+        options = entry.options
+
         self._room_name = config[CONF_ROOM_NAME]
         self._temp_sensor_id = config[CONF_TEMPERATURE_SENSOR]
         self._climate_entity_id = config[CONF_CLIMATE_ENTITY]
@@ -146,7 +154,6 @@ class PredictiveHeatingClimate(ClimateEntity):
 
         # Gas / heat-source (options win over data, so users can reconfigure
         # without re-adding the room).
-        options = entry.options
         self._gas_sensor_id = (
             options.get(CONF_GAS_METER_SENSOR) or config.get(CONF_GAS_METER_SENSOR)
         )
@@ -211,7 +218,7 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._attr_unique_id = f"predictive_heating_{entry.entry_id}"
         self._attr_name = f"Predictive {self._room_name}"
 
-        # Apply options overrides (options already fetched above)
+        # Apply preset-temperature overrides from options
         if "comfort_temp" in options:
             self._controller.preset_temps[PresetMode.COMFORT] = options["comfort_temp"]
         if "eco_temp" in options:
