@@ -91,6 +91,40 @@ DEFAULT_NUDGE_INTERVAL_MIN = 10  # minutes
 NUDGE_COLD_BAND = 0.3   # °C: below target − this → nudge up
 NUDGE_WARM_BAND = 0.3   # °C: above target + this → nudge down
 
+# ── Predictive pre-heat + MPC (v0.3) ──────────────────────────────
+#
+# Weather entity: a HA `weather.*` entity supplying hourly forecast
+# temperatures, used by the pre-heat planner to compute lead time.
+CONF_WEATHER_ENTITY = "weather_entity"
+# Person entities: any number of `person.*` entities. When everyone is
+# away for `CONF_AWAY_GRACE_MIN` minutes the room auto-switches to the
+# Away preset; when anyone comes home the previous preset is restored.
+CONF_PERSON_ENTITIES = "person_entities"
+CONF_AWAY_GRACE_MIN = "away_grace_min"
+# Comfort ramp: "instant" snaps the target up at the start of the
+# pre-heat window; "gradual" linearly ramps it over the window so the
+# room warms smoothly and the MPC has a rising setpoint to track.
+CONF_COMFORT_RAMP = "comfort_ramp"
+# Master switch for the MPC. When disabled we fall back to the v0.1
+# hysteresis controller.
+CONF_MPC_ENABLED = "mpc_enabled"
+# MPC horizon and granularity. Longer horizon = more anticipation but
+# the search space grows quadratically with N.
+CONF_MPC_HORIZON_MIN = "mpc_horizon_min"
+CONF_MPC_STEP_MIN = "mpc_step_min"
+# Transport delay on the boiler / radiator circuit. This is the
+# single most important MPC parameter for overshoot prevention —
+# increase it if you still see overshoot despite MPC being active.
+CONF_MPC_CONTROL_DELAY_MIN = "mpc_control_delay_min"
+
+DEFAULT_COMFORT_RAMP = "gradual"  # or "instant"
+DEFAULT_AWAY_GRACE_MIN = 10
+DEFAULT_MPC_ENABLED = True
+DEFAULT_MPC_HORIZON_MIN = 60
+DEFAULT_MPC_STEP_MIN = 5
+DEFAULT_MPC_CONTROL_DELAY_MIN = 5
+COMFORT_RAMP_OPTIONS = ("gradual", "instant")
+
 # Gas / heat source
 # Dutch Groningen-gas upper calorific value in MJ/m³ (typical billed value).
 DEFAULT_GAS_CALORIFIC_VALUE = 35.17

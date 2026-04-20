@@ -44,29 +44,46 @@ from homeassistant.helpers.event import (
 )
 
 from .const import (
+    CONF_AWAY_GRACE_MIN,
     CONF_BOILER_EFFICIENCY,
     CONF_CLIMATE_ENTITY,
+    CONF_COMFORT_RAMP,
     CONF_GAS_CALORIFIC_VALUE,
     CONF_GAS_METER_SENSOR,
     CONF_HEAT_SHARE,
+    CONF_MPC_CONTROL_DELAY_MIN,
+    CONF_MPC_ENABLED,
+    CONF_MPC_HORIZON_MIN,
+    CONF_MPC_STEP_MIN,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
+    CONF_PERSON_ENTITIES,
     CONF_ROOM_NAME,
     CONF_SCHEDULE_ENTITY,
     CONF_SCHEDULE_OFF_TEMP,
     CONF_SCHEDULE_ON_TEMP,
     CONF_TEMPERATURE_SENSOR,
+    CONF_WEATHER_ENTITY,
     CONF_WINDOW_SENSORS,
+    DEFAULT_AWAY_GRACE_MIN,
     DEFAULT_AWAY_TEMP,
     DEFAULT_BOILER_EFFICIENCY,
+    DEFAULT_COMFORT_RAMP,
     DEFAULT_COMFORT_TEMP,
     DEFAULT_ECO_TEMP,
     DEFAULT_GAS_CALORIFIC_VALUE,
     DEFAULT_HEAT_SHARE,
+    DEFAULT_MPC_CONTROL_DELAY_MIN,
+    DEFAULT_MPC_ENABLED,
+    DEFAULT_MPC_HORIZON_MIN,
+    DEFAULT_MPC_STEP_MIN,
     DOMAIN,
     UPDATE_INTERVAL,
 )
 from .controller import HeatingAction, HeatingController, PresetMode
 from .heat_source import GasHeatSource
+from .mpc import MPCConfig
+from .preheat import PreheatConfig, PreheatPlan, PreheatPlanner
+from .presence import PresenceConfig, PresenceMonitor
 from .solar import estimate_solar_irradiance
 from .thermal_model import ThermalModel, ThermalObservation
 from .zone import HeatingZone
@@ -130,7 +147,6 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._model = model
         self._config = config
         self._zone = zone
-        self._controller = HeatingController(model)
 
         # Fetch options up-front — several blocks below rely on options
         # winning over the initial config entry data, so users can tweak
@@ -139,6 +155,48 @@ class PredictiveHeatingClimate(ClimateEntity):
         # this line raises NameError and the climate entity silently
         # fails to register.
         options = entry.options
+
+        # ── v0.3: MPC, pre-heat, presence ─────────────────────────
+        mpc_enabled = bool(options.get(CONF_MPC_ENABLED, DEFAULT_MPC_ENABLED))
+        mpc_config = MPCConfig(
+            horizon_min=float(options.get(
+                CONF_MPC_HORIZON_MIN, DEFAULT_MPC_HORIZON_MIN
+            )),
+            step_min=float(options.get(CONF_MPC_STEP_MIN, DEFAULT_MPC_STEP_MIN)),
+            control_delay_min=float(options.get(
+                CONF_MPC_CONTROL_DELAY_MIN, DEFAULT_MPC_CONTROL_DELAY_MIN
+            )),
+        )
+        self._controller = HeatingController(
+            model,
+            mpc_enabled=mpc_enabled,
+            mpc_config=mpc_config,
+        )
+        self._preheat_planner = PreheatPlanner(
+            model,
+            PreheatConfig(
+                comfort_ramp=options.get(CONF_COMFORT_RAMP, DEFAULT_COMFORT_RAMP),
+            ),
+        )
+        self._last_preheat_plan: PreheatPlan | None = None
+        self._weather_entity_id: str | None = (
+            options.get(CONF_WEATHER_ENTITY)
+            or config.get(CONF_WEATHER_ENTITY)
+        )
+        self._forecast_hourly: list[float] = []
+        person_entities = (
+            options.get(CONF_PERSON_ENTITIES)
+            or config.get(CONF_PERSON_ENTITIES)
+            or []
+        )
+        self._presence = PresenceMonitor(
+            person_entities,
+            PresenceConfig(
+                away_grace_min=float(options.get(
+                    CONF_AWAY_GRACE_MIN, DEFAULT_AWAY_GRACE_MIN
+                )),
+            ),
+        )
 
         self._room_name = config[CONF_ROOM_NAME]
         self._temp_sensor_id = config[CONF_TEMPERATURE_SENSOR]
@@ -299,6 +357,26 @@ class PredictiveHeatingClimate(ClimateEntity):
                 )
             )
 
+        # Track weather entity (for outdoor forecast used in pre-heat planning)
+        if self._weather_entity_id:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass,
+                    [self._weather_entity_id],
+                    self._async_weather_changed,
+                )
+            )
+
+        # Track person entities for presence-based Away switching
+        if self._presence.enabled:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass,
+                    list(self._presence.person_entity_ids),
+                    self._async_presence_changed,
+                )
+            )
+
         # Periodic model update
         self.async_on_remove(
             async_track_time_interval(
@@ -314,6 +392,16 @@ class PredictiveHeatingClimate(ClimateEntity):
         # Apply the schedule's current state if configured.
         if self._schedule_entity_id:
             self._apply_schedule_state(self.hass.states.get(self._schedule_entity_id))
+
+        # Prime the weather forecast cache.
+        if self._weather_entity_id:
+            self._refresh_weather_forecast(
+                self.hass.states.get(self._weather_entity_id)
+            )
+
+        # Prime the presence state so we start in Away if everyone's gone.
+        if self._presence.enabled:
+            self._evaluate_presence()
 
     def _read_current_state(self) -> None:
         """Read current sensor values."""
@@ -420,25 +508,22 @@ class PredictiveHeatingClimate(ClimateEntity):
 
     def _apply_schedule_state(self, state) -> None:
         """
-        Translate a schedule-entity state into a target temperature.
+        Update the cached schedule state + delegate target selection
+        to the preheat planner.
 
-        The user configures two presets on the config flow:
-          - ``schedule_on_temp``  (applied when the schedule is ON)
-          - ``schedule_off_temp`` (applied when the schedule is OFF)
-
-        Additionally, if the schedule state exposes a ``temperature``
-        attribute (newer HA per-slot data), that overrides the on/off
-        default.
+        When the schedule exposes a per-slot ``temperature`` attribute
+        (newer HA versions), we treat that as the "high" target and
+        keep the user-configured off-temp as the fallback "low" target.
         """
         if state is None:
             self._schedule_active_state = None
             self._schedule_override_temp = None
+            self._apply_preheat_plan()
             return
 
         s = state.state
         self._schedule_active_state = s
 
-        # Per-slot override
         override = state.attributes.get("temperature")
         try:
             override_val = float(override) if override is not None else None
@@ -446,24 +531,147 @@ class PredictiveHeatingClimate(ClimateEntity):
             override_val = None
         self._schedule_override_temp = override_val
 
-        if override_val is not None:
-            new_target = override_val
-        elif s == "on":
-            new_target = self._schedule_on_temp
-        elif s == "off":
-            new_target = self._schedule_off_temp
-        else:
-            # Unavailable / unknown — leave the current target alone.
+        self._apply_preheat_plan()
+
+    # ── v0.3 helpers: preheat, weather, presence ─────────────────
+
+    def _schedule_is_on(self) -> bool:
+        return self._schedule_active_state == "on"
+
+    def _schedule_targets(self) -> tuple[float, float]:
+        """Return (low_target, high_target) for the current schedule."""
+        high = (
+            self._schedule_override_temp
+            if self._schedule_override_temp is not None
+            else self._schedule_on_temp
+        )
+        low = self._schedule_off_temp
+        return low, high
+
+    def _schedule_next_transition_ts(self) -> float | None:
+        """Best-effort unix timestamp of the next schedule on/off flip."""
+        if not self._schedule_entity_id:
+            return None
+        state = self.hass.states.get(self._schedule_entity_id)
+        if state is None:
+            return None
+
+        # HA exposes next_event on schedule entities as a datetime string.
+        # Parse defensively — formats vary across versions.
+        for attr_name in ("next_event", "next_toggle", "next"):
+            raw = state.attributes.get(attr_name)
+            if raw is None:
+                continue
+            ts = self._parse_timestamp(raw)
+            if ts is not None:
+                return ts
+        return None
+
+    @staticmethod
+    def _parse_timestamp(value) -> float | None:
+        """Convert various timestamp shapes to a unix ts float."""
+        from datetime import datetime
+
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if hasattr(value, "timestamp"):
+            try:
+                return float(value.timestamp())
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, str):
+            try:
+                # Python 3.11+ parses "Z" natively; older: replace with +00:00.
+                v = value.replace("Z", "+00:00")
+                return datetime.fromisoformat(v).timestamp()
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _apply_preheat_plan(self) -> None:
+        """Run the preheat planner and push the effective target to the controller."""
+        low, high = self._schedule_targets()
+        if self._current_temp is None:
+            # Nothing sensible to plan without a reading — fall back to low.
+            self._target_temp = low
+            self._controller.set_target_temp(low)
             return
 
-        # Only override if the user hasn't just set a manual target via
-        # the climate entity. We always override — it's what "follow
-        # schedule" means. If the user wants manual control, they
-        # simply don't configure a schedule entity (or they can clear
-        # it in options).
+        outdoor = self._outdoor_temp if self._outdoor_temp is not None else 10.0
+        plan = self._preheat_planner.plan(
+            now_ts=time.time(),
+            t_indoor=self._current_temp,
+            t_outdoor=outdoor,
+            low_target=low,
+            high_target=high,
+            schedule_on=self._schedule_is_on(),
+            next_transition_ts=self._schedule_next_transition_ts(),
+            forecast_hourly=self._forecast_hourly,
+            solar_irradiance=estimate_solar_irradiance(self.hass),
+        )
+        self._last_preheat_plan = plan
+
+        new_target = plan.effective_target_temp
         if abs(new_target - self._target_temp) > 0.01:
             self._target_temp = new_target
             self._controller.set_target_temp(new_target)
+
+    @callback
+    def _async_weather_changed(self, event) -> None:
+        """Weather entity updated → refresh the forecast cache."""
+        self._refresh_weather_forecast(event.data.get("new_state"))
+
+    def _refresh_weather_forecast(self, state) -> None:
+        """Extract an hourly temperature list from a weather entity state."""
+        if state is None:
+            self._forecast_hourly = []
+            return
+        # HA's weather entities expose `forecast` as a list of dicts
+        # with a "temperature" key. Some integrations return daily
+        # forecasts; we just read the first N entries either way.
+        forecast = state.attributes.get("forecast") or []
+        temps: list[float] = []
+        for entry in forecast[:24]:
+            t = entry.get("temperature") or entry.get("native_temperature")
+            if t is None:
+                continue
+            try:
+                temps.append(float(t))
+            except (TypeError, ValueError):
+                continue
+        self._forecast_hourly = temps
+
+    @callback
+    def _async_presence_changed(self, event) -> None:
+        """Person entity state changed → re-evaluate presence."""
+        self._evaluate_presence()
+
+    def _evaluate_presence(self) -> None:
+        """
+        Feed the monitor the latest person-entity states and react.
+
+        We only change the preset here; the target temp is recomputed
+        by ``set_preset_mode`` → ``_run_control_loop``.
+        """
+        if not self._presence.enabled:
+            return
+        states = {
+            eid: (self.hass.states.get(eid).state
+                  if self.hass.states.get(eid) is not None else None)
+            for eid in self._presence.person_entity_ids
+        }
+        decision = self._presence.update(states)
+        if decision == "away":
+            # Remember the currently-active preset so we can restore it.
+            self._presence.remember_preset(str(self._preset_mode))
+            self.hass.async_create_task(
+                self.async_set_preset_mode(PresetMode.AWAY.value)
+            )
+        elif decision == "home":
+            previous = self._presence.saved_preset_or(PresetMode.COMFORT.value)
+            self.hass.async_create_task(self.async_set_preset_mode(previous))
 
     @callback
     def _async_underlying_changed(self, event) -> None:
@@ -553,6 +761,13 @@ class PredictiveHeatingClimate(ClimateEntity):
             heat_power_w=measured_heat_w,
         )
         self._model.add_observation(obs)
+
+        # v0.3: re-evaluate presence (grace-period may have elapsed) and
+        # roll the pre-heat plan forward each cycle.
+        if self._presence.enabled:
+            self._evaluate_presence()
+        if self._schedule_entity_id:
+            self._apply_preheat_plan()
 
         self._run_control_loop()
         self.async_write_ha_state()
@@ -725,6 +940,37 @@ class PredictiveHeatingClimate(ClimateEntity):
         if self._window_sensor_ids:
             attrs["window_sensors"] = list(self._window_sensor_ids)
             attrs["window_open"] = self._window_open
+
+        # v0.3: predictive pre-heat diagnostics
+        if self._last_preheat_plan is not None:
+            attrs["preheat"] = self._last_preheat_plan.as_diagnostic()
+
+        # v0.3: MPC diagnostics
+        attrs["control_mode"] = self._controller.state.mode_used
+        mpc_result = self._controller.state.last_mpc_result
+        if mpc_result is not None:
+            attrs["mpc"] = {
+                "action": mpc_result.action,
+                "reason": mpc_result.reason,
+                "cost": round(mpc_result.cost, 4),
+                "switch_at_step": mpc_result.switch_at_step,
+                "hysteresis_would_do": mpc_result.hysteresis_action,
+                # Only expose a short trajectory preview so attrs stay small.
+                "trajectory_preview": [
+                    round(t, 2) for t in mpc_result.predicted_trajectory[:6]
+                ],
+            }
+
+        # v0.3: presence diagnostics
+        if self._presence.enabled:
+            attrs["presence"] = {
+                "person_entities": list(self._presence.person_entity_ids),
+                "currently_away": self._presence.state.currently_away,
+                "saved_preset": self._presence.state.saved_preset,
+            }
+
+        if self._weather_entity_id and self._forecast_hourly:
+            attrs["weather_forecast_hours"] = self._forecast_hourly[:6]
 
         return attrs
 

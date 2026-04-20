@@ -55,7 +55,15 @@
           "building_type": "Building Type",
           "schedule_entity": "Schedule entity to follow",
           "schedule_on_temp": "Temperature when schedule is ON",
-          "schedule_off_temp": "Temperature when schedule is OFF"
+          "schedule_off_temp": "Temperature when schedule is OFF",
+          "weather_entity": "Weather entity (for outdoor forecast)",
+          "person_entities": "Person entities (for Away auto-switching)",
+          "away_grace_min": "Minutes before switching to Away when nobody home",
+          "comfort_ramp": "Comfort ramp style",
+          "mpc_enabled": "Enable MPC (anti-overshoot)",
+          "mpc_horizon_min": "MPC planning horizon",
+          "mpc_step_min": "MPC timestep",
+          "mpc_control_delay_min": "Boiler/radiator transport delay"
         },
         "data_description": {
           "room_name": "Renaming a room keeps all learned thermal properties — only the displayed name changes.",
@@ -69,7 +77,15 @@
           "building_type": "Insulation quality category. Only affects the initial estimate — the EKF takes over once it has observations.",
           "schedule_entity": "Leave blank to set the temperature manually. When set, the room target follows this schedule entity's ON/OFF state. If the schedule slot defines a `temperature` attribute, that wins over the on/off defaults.",
           "schedule_on_temp": "Target temperature while the schedule entity is ON. Defaults to the Comfort temperature.",
-          "schedule_off_temp": "Target temperature while the schedule entity is OFF. Defaults to the Eco temperature."
+          "schedule_off_temp": "Target temperature while the schedule entity is OFF. Defaults to the Eco temperature.",
+          "weather_entity": "HA weather.* entity. The planner reads its hourly forecast to extend pre-heat time on cold nights.",
+          "person_entities": "When every listed person is away past the grace period the room switches to Away. When anyone returns the previous preset is restored automatically.",
+          "away_grace_min": "Prevents a momentary GPS/phone glitch from cooling the room down. Default 10 min.",
+          "comfort_ramp": "gradual: target temp ramps linearly from low to high over the pre-heat window. instant: jumps to the high target at the start of the window.",
+          "mpc_enabled": "When enabled, a short-horizon MPC plans ahead using the thermal model to minimise overshoot. Falls back to hysteresis until the model has calibrated.",
+          "mpc_horizon_min": "How far ahead the MPC plans. Longer = better overshoot prevention, more computation.",
+          "mpc_step_min": "Time between planning steps. 5 min is a good balance.",
+          "mpc_control_delay_min": "Minutes of transport delay the MPC assumes between the setpoint command and heat actually stopping. Increase if you still see overshoot."
         }
       }
     }

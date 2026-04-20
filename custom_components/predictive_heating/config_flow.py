@@ -15,34 +15,49 @@ from homeassistant.helpers import selector
 
 from .const import (
     BUILDING_TYPES,
+    COMFORT_RAMP_OPTIONS,
+    CONF_AWAY_GRACE_MIN,
     CONF_BOILER_EFFICIENCY,
     CONF_BUILDING_TYPE,
     CONF_CEILING_HEIGHT_M,
     CONF_CLIMATE_ENTITY,
+    CONF_COMFORT_RAMP,
     CONF_FLOOR_AREA_M2,
     CONF_GAS_CALORIFIC_VALUE,
     CONF_GAS_METER_SENSOR,
     CONF_HEAT_SHARE,
     CONF_HUMIDITY_SENSOR,
     CONF_MAX_SETPOINT_DELTA,
+    CONF_MPC_CONTROL_DELAY_MIN,
+    CONF_MPC_ENABLED,
+    CONF_MPC_HORIZON_MIN,
+    CONF_MPC_STEP_MIN,
     CONF_NUDGE_INTERVAL_MIN,
     CONF_NUDGE_STEP,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
+    CONF_PERSON_ENTITIES,
     CONF_ROOM_NAME,
     CONF_SCHEDULE_ENTITY,
     CONF_SCHEDULE_OFF_TEMP,
     CONF_SCHEDULE_ON_TEMP,
     CONF_TEMPERATURE_SENSOR,
+    CONF_WEATHER_ENTITY,
     CONF_WINDOW_SENSORS,
+    DEFAULT_AWAY_GRACE_MIN,
     DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_BUILDING_TYPE,
     DEFAULT_CEILING_HEIGHT_M,
+    DEFAULT_COMFORT_RAMP,
     DEFAULT_COMFORT_TEMP,
     DEFAULT_ECO_TEMP,
     DEFAULT_AWAY_TEMP,
     DEFAULT_GAS_CALORIFIC_VALUE,
     DEFAULT_HEAT_SHARE,
     DEFAULT_MAX_SETPOINT_DELTA,
+    DEFAULT_MPC_CONTROL_DELAY_MIN,
+    DEFAULT_MPC_ENABLED,
+    DEFAULT_MPC_HORIZON_MIN,
+    DEFAULT_MPC_STEP_MIN,
     DEFAULT_NUDGE_INTERVAL_MIN,
     DEFAULT_NUDGE_STEP,
     DEFAULT_SLEEP_TEMP,
@@ -53,6 +68,11 @@ from .const import (
 _BUILDING_TYPE_OPTIONS = [
     selector.SelectOptionDict(value=key, label=key.replace("_", " ").title())
     for key in BUILDING_TYPES
+]
+
+_COMFORT_RAMP_OPTIONS = [
+    selector.SelectOptionDict(value=v, label=v.title())
+    for v in COMFORT_RAMP_OPTIONS
 ]
 
 _LOGGER = logging.getLogger(__name__)
@@ -389,6 +409,86 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                 selector.NumberSelectorConfig(
                     min=5.0, max=30.0, step=0.5,
                     unit_of_measurement="°C",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            # ── Predictive pre-heat + MPC (v0.3) ──────────────────
+            vol.Optional(
+                CONF_WEATHER_ENTITY,
+                default=(
+                    options.get(CONF_WEATHER_ENTITY)
+                    or data.get(CONF_WEATHER_ENTITY)
+                    or vol.UNDEFINED
+                ),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="weather")
+            ),
+            vol.Optional(
+                CONF_PERSON_ENTITIES,
+                default=(
+                    options.get(CONF_PERSON_ENTITIES)
+                    or data.get(CONF_PERSON_ENTITIES)
+                    or vol.UNDEFINED
+                ),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain="person",
+                    multiple=True,
+                )
+            ),
+            vol.Optional(
+                CONF_AWAY_GRACE_MIN,
+                default=options.get(CONF_AWAY_GRACE_MIN, DEFAULT_AWAY_GRACE_MIN),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0, max=120, step=1,
+                    unit_of_measurement="min",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_COMFORT_RAMP,
+                default=options.get(CONF_COMFORT_RAMP, DEFAULT_COMFORT_RAMP),
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=_COMFORT_RAMP_OPTIONS,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Optional(
+                CONF_MPC_ENABLED,
+                default=options.get(CONF_MPC_ENABLED, DEFAULT_MPC_ENABLED),
+            ): selector.BooleanSelector(),
+            vol.Optional(
+                CONF_MPC_HORIZON_MIN,
+                default=options.get(CONF_MPC_HORIZON_MIN, DEFAULT_MPC_HORIZON_MIN),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=15, max=240, step=5,
+                    unit_of_measurement="min",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_MPC_STEP_MIN,
+                default=options.get(CONF_MPC_STEP_MIN, DEFAULT_MPC_STEP_MIN),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=1, max=15, step=1,
+                    unit_of_measurement="min",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_MPC_CONTROL_DELAY_MIN,
+                default=options.get(
+                    CONF_MPC_CONTROL_DELAY_MIN,
+                    DEFAULT_MPC_CONTROL_DELAY_MIN,
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0, max=30, step=1,
+                    unit_of_measurement="min",
                     mode=selector.NumberSelectorMode.BOX,
                 )
             ),
