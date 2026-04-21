@@ -18,7 +18,6 @@ import logging
 
 from homeassistant.components.number import (
     NumberEntity,
-    NumberEntityFeature,
     NumberMode,
 )
 from homeassistant.config_entries import ConfigEntry
@@ -87,7 +86,6 @@ class PresetTemperatureNumber(NumberEntity, RestoreEntity):
     _attr_has_entity_name = True
     _attr_mode = NumberMode.BOX
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-    _attr_supported_features = NumberEntityFeature(0)
 
     def __init__(
         self,
