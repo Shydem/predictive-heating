@@ -43,9 +43,11 @@ import time
 from dataclasses import dataclass
 
 from .const import (
+    DEFAULT_IDLE_MIN_TEMP,
     DEFAULT_MAX_SETPOINT_DELTA,
     DEFAULT_NUDGE_INTERVAL_MIN,
     DEFAULT_NUDGE_STEP,
+    DEFAULT_WINDOW_OPEN_TEMP,
     DOMAIN,
 )
 
@@ -188,8 +190,16 @@ class HeatingZone:
         Return the setpoint to push to the shared thermostat, or ``None``
         if nothing should be sent right now.
 
+        Strategy:
+            The "idle at 5°C" logic has been removed — when no room wants
+            *active* heating we still leave the thermostat at the highest
+            configured room target, so the thermostat's own controller
+            can modulate gently and we don't trigger a cold-start from a
+            5→21 jump when the schedule flips. The "any_room_wants_heat"
+            flag is now a soft signal; the zone always returns *some*
+            target temperature when a leader exists.
+
         Rules:
-            - If no room wants heat → return None (caller idles the stat).
             - First call since boot → always send the target.
             - Subsequent calls → only send if the target changed, or if
               the minimum quiet interval has elapsed and the setpoint
@@ -199,15 +209,31 @@ class HeatingZone:
         The thermostat's own OpenTherm loop handles modulation; we just
         tell it what temperature we want and leave it alone.
         """
-        if not self.any_room_wants_heat:
-            return None
-
         leader = self.leading_room
-        if leader is None or leader.current_temp is None:
-            return None
-
-        target = round(leader.target_temp, 1)
-        current = leader.current_temp
+        if leader is None:
+            # No room actively wants heat — fall back to the *highest*
+            # registered room target, so the thermostat stays at the
+            # user's preferred setpoint and doesn't drop to anti-frost.
+            targets = [
+                r.target_temp
+                for r in self._rooms.values()
+                if r.current_temp is not None
+            ]
+            if not targets:
+                return None
+            target = round(max(targets), 1)
+            current = max(
+                (r.current_temp for r in self._rooms.values()
+                 if r.current_temp is not None),
+                default=target,
+            )
+            leader_name = "idle_max_target"
+        else:
+            if leader.current_temp is None:
+                return None
+            target = round(leader.target_temp, 1)
+            current = leader.current_temp
+            leader_name = leader.room_name
 
         # First send since boot (or after reset): always deliver the target.
         if self._last_setpoint is None:
@@ -215,7 +241,7 @@ class HeatingZone:
                 target,
                 now=now,
                 reason="initial",
-                leader=leader.room_name,
+                leader=leader_name,
                 target=target,
                 current=current,
             )
@@ -234,11 +260,19 @@ class HeatingZone:
             target,
             now=now,
             reason="target_changed",
-            leader=leader.room_name,
+            leader=leader_name,
             target=target,
             current=current,
         )
         return target
+
+    def window_open_setpoint(self) -> float:
+        """Override setpoint to send when any room has a window open.
+
+        This is *not* idle — it's a short-lived "cut the boiler" signal
+        used while the room is being ventilated.
+        """
+        return DEFAULT_WINDOW_OPEN_TEMP
 
     def _commit_setpoint(
         self,

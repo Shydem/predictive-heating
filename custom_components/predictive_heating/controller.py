@@ -46,6 +46,7 @@ class PresetMode(StrEnum):
     AWAY = "away"
     SLEEP = "sleep"
     BOOST = "boost"
+    VACATION = "vacation"
     NONE = "none"
 
 
@@ -89,6 +90,7 @@ class HeatingController:
         *,
         mpc_enabled: bool = False,
         mpc_config: MPCConfig | None = None,
+        preset_temps_source: dict | None = None,
     ) -> None:
         self.model = thermal_model
         self.hysteresis = hysteresis
@@ -96,14 +98,36 @@ class HeatingController:
         self.mpc_enabled = mpc_enabled
         self._mpc = MPCController(thermal_model, mpc_config) if mpc_enabled else None
 
-        # Preset temperatures (can be updated via HA number entities)
+        # ``preset_temps_source`` is a shared dict owned by the integration
+        # (populated by the preset number entities). The controller always
+        # reads from it on demand so a change via number entity is picked
+        # up on the next ``set_preset`` call without extra plumbing.
+        self._preset_src = preset_temps_source
+
+        # Preset temperatures (fallback defaults). The source dict, when
+        # supplied, wins whenever it has a matching slug.
         self.preset_temps: dict[PresetMode, float] = {
             PresetMode.COMFORT: 21.0,
             PresetMode.ECO: 18.0,
             PresetMode.AWAY: 15.0,
             PresetMode.SLEEP: 18.5,
             PresetMode.BOOST: 24.0,
+            PresetMode.VACATION: 12.0,
         }
+
+    def _current_preset_temp(self, preset: PresetMode) -> float | None:
+        if preset == PresetMode.NONE:
+            return None
+        fallback = self.preset_temps.get(preset)
+        if self._preset_src is None:
+            return fallback
+        val = self._preset_src.get(preset.value)
+        if val is None:
+            return fallback
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return fallback
 
     def set_mpc_enabled(self, enabled: bool, config: MPCConfig | None = None) -> None:
         """Toggle MPC at runtime (called from the options flow)."""
@@ -121,9 +145,23 @@ class HeatingController:
     def set_preset(self, preset: PresetMode) -> None:
         """Change the active preset mode."""
         self.state.preset = preset
-        if preset in self.preset_temps:
-            self.state.target_temp = self.preset_temps[preset]
+        t = self._current_preset_temp(preset)
+        if t is not None:
+            self.state.target_temp = t
         _LOGGER.debug("Preset changed to %s (%.1f°C)", preset, self.state.target_temp)
+
+    def refresh_target_from_preset(self) -> None:
+        """Re-read the active preset's number entity and update target.
+
+        Called by the climate entity after a preset-number change so the
+        controller picks up the new temperature without having to flip
+        presets.
+        """
+        if self.state.preset == PresetMode.NONE:
+            return
+        t = self._current_preset_temp(self.state.preset)
+        if t is not None:
+            self.state.target_temp = t
 
     def set_target_temp(self, temp: float) -> None:
         """Manually override the target temperature."""

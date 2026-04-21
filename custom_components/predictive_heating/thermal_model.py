@@ -31,12 +31,15 @@ from .const import (
     BUILDING_TYPES,
     DEFAULT_BUILDING_TYPE,
     DEFAULT_CEILING_HEIGHT_M,
+    DEFAULT_COUPLING_U,
     DEFAULT_HEAT_LOSS_COEFFICIENT,
     DEFAULT_HEATING_POWER,
     DEFAULT_SOLAR_GAIN_FACTOR,
     DEFAULT_THERMAL_MASS,
     MIN_ACTIVE_SAMPLES,
     MIN_IDLE_SAMPLES,
+    PREDICTION_HISTORY_MAX,
+    PREDICTION_HORIZON_HOURS,
     STATE_CALIBRATED,
     STATE_LEARNING,
 )
@@ -104,6 +107,26 @@ class ThermalObservation:
     # the preferred heat input for the EKF — it's much richer than a
     # binary on/off because it captures modulation and DHW draws.
     heat_power_w: float | None = None
+    # Summed heat contribution (W) from neighbouring rooms via
+    # multi-room thermal coupling. The neighbour temperatures are
+    # computed and aggregated by the climate entity before being
+    # passed to the model.
+    coupling_power_w: float = 0.0
+
+
+@dataclass
+class CouplingSpec:
+    """Description of a thermal connection to another room."""
+
+    # entry_id of the other predictive-heating room
+    neighbour_entry_id: str
+    # Heat-exchange coefficient (W/K). Positive = heat flows from the
+    # warmer side to the colder side.
+    u_value: float = DEFAULT_COUPLING_U
+    # If false, the coupling is *declared* but not included in the
+    # learning step — useful when you want to disable a particular
+    # connection (e.g. a door is closed) without removing it.
+    enabled: bool = True
 
 
 @dataclass
@@ -156,6 +179,21 @@ class ThermalModel:
     # which is intentionally frozen (dh/dP=0) when measured_heat_w is given.
     _measured_power_sum: float = 0.0
     _measured_power_count: int = 0
+
+    # Multi-room coupling (v0.5).
+    # ``couplings`` is the declared list of possible connections; only
+    # those marked ``enabled`` participate in the learning / prediction
+    # math. ``last_dT_observed`` and ``last_dT_predicted`` keep the raw
+    # EKF residual so the gas-heat source can distinguish cooking /
+    # shower spikes from real space heating.
+    couplings: list = field(default_factory=list)  # list[CouplingSpec]
+    last_dT_observed: float = 0.0
+    last_dT_predicted: float = 0.0
+
+    # Prediction trace: for each periodic update we log the rolling
+    # 8-hour forecast so the dashboard can overlay "what we thought
+    # would happen 8 hours ago" against the observed trajectory.
+    prediction_history: list = field(default_factory=list)
 
     def __post_init__(self):
         if HAS_NUMPY and self._ekf is None:
@@ -242,6 +280,14 @@ class ThermalModel:
             self.active_count += 1
         self.total_updates += 1
 
+        # Merge the coupling heat contribution into the measured heat
+        # input. The EKF treats this as extra "known" heat-in, so H
+        # estimates stay clean even when neighbour rooms are warmer.
+        measured_w = prev.heat_power_w
+        coupling_w = prev.coupling_power_w
+        if coupling_w:
+            measured_w = (measured_w or 0.0) + coupling_w
+
         # ── EKF update (v0.2) ──
         if HAS_NUMPY and self._ekf is not None:
             u_heat = 1.0 if prev.heating_on else 0.0
@@ -252,8 +298,14 @@ class ThermalModel:
                 u_heat=u_heat,
                 I_solar=prev.solar_irradiance,
                 dT_measured=dT,
-                measured_heat_w=prev.heat_power_w,
+                measured_heat_w=measured_w,
             )
+
+            # Record the raw dT vs predicted dT for spike detection:
+            # if the gas source reported heat_power_w but the room didn't
+            # warm as expected we need to flag it (see heat_source.py).
+            self.last_dT_observed = dT
+            self.last_dT_predicted = dT - innovation
 
             # Sync EKF estimates back to params
             ekf_state = self._ekf.state
@@ -393,6 +445,119 @@ class ThermalModel:
 
         return temp
 
+    def predict_trajectory(
+        self,
+        *,
+        t_indoor: float,
+        hours_ahead: float,
+        outdoor_trace: list[float] | None,
+        solar_trace: list[float] | None,
+        heating_fraction_trace: list[float] | None,
+        step_minutes: float = 15.0,
+    ) -> list[dict]:
+        """
+        Simulate a detailed forecast returning a list of
+        ``{"t": offset_hours, "temperature": °C, "q_heat_w": W,
+          "q_solar_w": W, "q_loss_w": W, "heating_fraction": 0..1}``
+        for each simulation step.
+
+        ``outdoor_trace``, ``solar_trace`` and ``heating_fraction_trace``
+        are optional lists with one entry per **hour**. Shorter traces
+        are padded by repeating the last known value; ``None`` treats
+        the input as constant (last known).
+        """
+        p = self.params
+        C_watt_h = p.thermal_mass * 1000 / 3600
+        if C_watt_h <= 0 or hours_ahead <= 0:
+            return []
+
+        step_h = step_minutes / 60.0
+        steps = max(1, int(hours_ahead / step_h))
+
+        def _sample(trace: list[float] | None, fallback: float, hour_offset: float) -> float:
+            if not trace:
+                return fallback
+            idx = min(len(trace) - 1, max(0, int(hour_offset)))
+            return float(trace[idx])
+
+        t = t_indoor
+        out: list[dict] = []
+        last_outdoor = outdoor_trace[0] if outdoor_trace else 10.0
+        for step in range(steps):
+            hour_offset = step * step_h
+            t_outdoor = _sample(outdoor_trace, last_outdoor, hour_offset)
+            solar = _sample(solar_trace, 0.0, hour_offset)
+            heat_frac = _sample(heating_fraction_trace, 0.0, hour_offset)
+
+            q_heat = heat_frac * p.heating_power
+            q_solar = solar * p.solar_gain_factor
+            q_loss = p.heat_loss_coeff * (t - t_outdoor)
+
+            dT = (q_heat + q_solar - q_loss) / C_watt_h * step_h
+            t += dT
+
+            out.append(
+                {
+                    "t": round(hour_offset + step_h, 3),
+                    "temperature": round(t, 3),
+                    "q_heat_w": round(q_heat, 1),
+                    "q_solar_w": round(q_solar, 1),
+                    "q_loss_w": round(q_loss, 1),
+                    "heating_fraction": round(heat_frac, 3),
+                    "t_outdoor": round(t_outdoor, 2),
+                }
+            )
+        return out
+
+    def record_prediction_snapshot(
+        self,
+        *,
+        timestamp: float,
+        t_indoor: float,
+        t_outdoor: float,
+        solar_irradiance: float,
+        horizon_hours: float = PREDICTION_HORIZON_HOURS,
+    ) -> None:
+        """
+        Store a forecast curve for later comparison with reality.
+
+        Keeps the model's opinion of the *next* ``horizon_hours`` hours
+        around so the dashboard can overlay "prediction from T-8h" on
+        top of the recorded actual trajectory.
+        """
+        # Very coarse outdoor trace — one point per hour, flat at the
+        # current outdoor reading. We accept this simplification
+        # because the dashboard overlay only needs a rough "was the
+        # model right?" check, not a science-grade forecast.
+        hours = int(horizon_hours)
+        outdoor_trace = [t_outdoor] * max(1, hours)
+        # Solar: naive fall-off — irradiance halves every 4 hours.
+        # Replaced at call time by the climate entity when a richer
+        # solar schedule is available.
+        solar_trace = [solar_irradiance * (0.5 ** (h / 4.0)) for h in range(hours)]
+        # Assume no forced heating; the forecast traces the natural
+        # evolution if the boiler were to stay off.
+        traj = self.predict_trajectory(
+            t_indoor=t_indoor,
+            hours_ahead=horizon_hours,
+            outdoor_trace=outdoor_trace,
+            solar_trace=solar_trace,
+            heating_fraction_trace=None,
+            step_minutes=15.0,
+        )
+        self.prediction_history.append(
+            {
+                "ts": timestamp,
+                "horizon_hours": horizon_hours,
+                "t_indoor": t_indoor,
+                "t_outdoor": t_outdoor,
+                "solar_irradiance": solar_irradiance,
+                "trajectory": traj,
+            }
+        )
+        if len(self.prediction_history) > PREDICTION_HISTORY_MAX:
+            self.prediction_history = self.prediction_history[-PREDICTION_HISTORY_MAX:]
+
     def time_to_reach(
         self,
         t_indoor: float,
@@ -440,8 +605,18 @@ class ThermalModel:
                     "heating_on": obs.heating_on,
                     "solar_irradiance": obs.solar_irradiance,
                     "heat_power_w": obs.heat_power_w,
+                    "coupling_power_w": obs.coupling_power_w,
                 }
             )
+
+        couplings_list = [
+            {
+                "neighbour_entry_id": c.neighbour_entry_id,
+                "u_value": c.u_value,
+                "enabled": c.enabled,
+            }
+            for c in self.couplings
+        ]
 
         result = {
             "version": 2,
@@ -469,6 +644,8 @@ class ThermalModel:
             "observations": obs_list,
             "h_history": self.h_history[-300:],
             "prediction_error_history": self.prediction_error_history[-200:],
+            "couplings": couplings_list,
+            "prediction_history": self.prediction_history[-PREDICTION_HISTORY_MAX:],
         }
 
         # Serialize EKF state if available
@@ -520,8 +697,25 @@ class ThermalModel:
         model._measured_power_sum = 0.0  # not persisted; derived from EMA in params
         model.h_history = data.get("h_history", [])
         model.prediction_error_history = data.get("prediction_error_history", [])
+        model.prediction_history = data.get("prediction_history", [])
         model._last_obs = None
         model._heat_source_state = data.get("heat_source")
+        model.last_dT_observed = float(data.get("last_dT_observed", 0.0))
+        model.last_dT_predicted = float(data.get("last_dT_predicted", 0.0))
+
+        # Couplings
+        model.couplings = []
+        for c in data.get("couplings", []) or []:
+            try:
+                model.couplings.append(
+                    CouplingSpec(
+                        neighbour_entry_id=c["neighbour_entry_id"],
+                        u_value=float(c.get("u_value", DEFAULT_COUPLING_U)),
+                        enabled=bool(c.get("enabled", True)),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
 
         # Restore observations
         model.observations = []
@@ -534,6 +728,7 @@ class ThermalModel:
                     heating_on=obs_data["heating_on"],
                     solar_irradiance=obs_data.get("solar_irradiance", 0.0),
                     heat_power_w=obs_data.get("heat_power_w"),
+                    coupling_power_w=obs_data.get("coupling_power_w", 0.0),
                 )
             )
 

@@ -13,6 +13,18 @@ CONF_HEAT_PUMP_COP_SENSOR = "heat_pump_cop_sensor"
 CONF_HEATING_ZONE = "heating_zone"
 CONF_MAX_SETPOINT_DELTA = "max_setpoint_delta"
 
+# Multi-room thermal coupling:
+# list of ``{neighbour_entry_id: str, u_value: float, enabled: bool}``
+# describing heat exchange between this room and another predictive-heating
+# room. The coupling term is ``U*(T_neighbour - T_room)``, added to the
+# standard loss equation. The optimizer/EKF only fits coupling for pairs
+# that are marked enabled. Defaults to an empty list — rooms are isolated
+# unless explicitly coupled.
+CONF_THERMAL_COUPLINGS = "thermal_couplings"
+# Default U-value (W/K) for an internal partition with a closed door —
+# glazed interior doors ≈ 20–40 W/K, solid doors ≈ 10–15 W/K.
+DEFAULT_COUPLING_U = 20.0
+
 # Gas / heat-source modelling (v0.3)
 CONF_GAS_METER_SENSOR = "gas_meter_sensor"
 CONF_BOILER_EFFICIENCY = "boiler_efficiency"
@@ -24,12 +36,35 @@ CONF_NUDGE_STEP = "nudge_step"
 CONF_NUDGE_INTERVAL_MIN = "nudge_interval_min"
 
 # Schedule support — the user points us at a `schedule.*` entity and
-# we follow its on/off state. When the schedule is ON the room target
-# is set to the configured "schedule on temp" (defaults to comfort),
-# when OFF to the "schedule off temp" (defaults to eco).
+# we follow it. The schedule's state is interpreted as a *mode selector*
+# (``preset`` attribute wins, then the raw on/off), and the actual
+# temperature for that mode is taken from the per-room preset number
+# entities (see below). This avoids the old conflict where
+# ``schedule_on_temp`` could disagree with the comfort preset setpoint.
 CONF_SCHEDULE_ENTITY = "schedule_entity"
+# Legacy keys, kept for back-compat with existing config entries. When
+# present and no preset number entity matches, we still honour them.
 CONF_SCHEDULE_ON_TEMP = "schedule_on_temp"
 CONF_SCHEDULE_OFF_TEMP = "schedule_off_temp"
+# Which preset to use when the schedule is ON / OFF. Defaults keep old
+# behaviour (on→comfort, off→eco). Any of the five preset names works.
+CONF_SCHEDULE_ON_PRESET = "schedule_on_preset"
+CONF_SCHEDULE_OFF_PRESET = "schedule_off_preset"
+DEFAULT_SCHEDULE_ON_PRESET = "comfort"
+DEFAULT_SCHEDULE_OFF_PRESET = "eco"
+# Default "vacation" preset — separate from away, for extended absences
+# where you want a deeper setback without losing the distinction in the UI.
+DEFAULT_VACATION_TEMP = 12.0
+
+# Override: when an input_boolean / switch attached here is ``on`` the
+# integration treats the room as "occupied / comfort", bypassing
+# presence-away and schedule-off logic. Used for WFH scenarios.
+CONF_OVERRIDE_ENTITY = "override_entity"
+# Optional presence sensor (binary_sensor) whose "on" state forces
+# comfort the same way an override does (e.g. a motion-based
+# occupancy sensor). Distinct from CONF_PERSON_ENTITIES which is a
+# global home/away signal.
+CONF_OCCUPANCY_ENTITY = "occupancy_entity"
 
 # Room-size / building-type bootstrap (v0.2 ROADMAP item)
 CONF_FLOOR_AREA_M2 = "floor_area_m2"
@@ -74,7 +109,16 @@ DEFAULT_COMFORT_TEMP = 21.0
 DEFAULT_ECO_TEMP = 18.0
 DEFAULT_AWAY_TEMP = 15.0
 DEFAULT_SLEEP_TEMP = 18.5
+DEFAULT_BOOST_TEMP = 24.0
 DEFAULT_HYSTERESIS = 0.3  # degrees C
+# When the room is in an "off" preset (no heat demand) we *still* send
+# the preset target to the underlying thermostat so it can modulate
+# itself instead of slamming shut. The min is a floor — we never send
+# below this even if a preset is configured lower (keeps anti-frost).
+DEFAULT_IDLE_MIN_TEMP = 10.0
+# When the window is open we drop to this floor setpoint; it's only
+# used as a short-term "boiler off" signal.
+DEFAULT_WINDOW_OPEN_TEMP = 5.0
 # Max degrees above target we'll ever push the setpoint to. Kept small so
 # OpenTherm modulation keeps working — an OpenTherm thermostat reads a
 # large (setpoint − measured) gap as "run hot water hard", which causes
@@ -139,6 +183,29 @@ DEFAULT_HEAT_SHARE = 1.0
 # these are usually noise when the meter ticks over a full unit.
 MIN_GAS_DT_SECONDS = 60
 
+# Cooking / shower spike rejection:
+#   A gas-usage spike that is NOT accompanied by a matching rise in room
+#   temperature is almost always a DHW event (shower) or a hob burner
+#   (cooking). We freeze the heat-power input to the EKF during these
+#   events so they don't pollute H / P_heat estimates.
+#
+#   Heuristic:
+#     * Watch the rolling (5 min) average dT / gas_power.
+#     * If gas_power > SPIKE_POWER_W for SPIKE_WINDOW_S seconds but the
+#       room has warmed less than SPIKE_EXPECTED_DT_RATIO × predicted
+#       dT during that window → mark the gas power as "non-heating".
+#     * The event auto-expires after MAX_SPIKE_DURATION_S.
+SPIKE_POWER_W = 6000.0          # watts — typical shower / oven demand
+SPIKE_EXPECTED_DT_RATIO = 0.3   # require ≥30% of predicted dT to credit it as heating
+SPIKE_WINDOW_S = 5 * 60         # observation window
+MAX_SPIKE_DURATION_S = 30 * 60  # never hold longer than this
+
+# Prediction history buffer: every periodic update records the model's
+# 8h-ahead forecast so the dashboard can overlay "prediction from 8h ago"
+# vs actual temperatures. Size is one point per update, so ~12/h × 24h.
+PREDICTION_HISTORY_MAX = 350
+PREDICTION_HORIZON_HOURS = 8.0
+
 # Thermal model states
 STATE_LEARNING = "learning"
 STATE_CALIBRATED = "calibrated"
@@ -151,4 +218,4 @@ MIN_ACTIVE_SAMPLES = 15
 UPDATE_INTERVAL = 120  # 2 minutes
 
 # Platforms
-PLATFORMS = ["climate", "sensor"]
+PLATFORMS = ["climate", "sensor", "number", "switch", "button"]

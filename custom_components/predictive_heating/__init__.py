@@ -53,7 +53,13 @@ from .zone import ZoneManager
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS_LIST = [Platform.CLIMATE, Platform.SENSOR]
+PLATFORMS_LIST = [
+    Platform.CLIMATE,
+    Platform.SENSOR,
+    Platform.NUMBER,
+    Platform.SWITCH,
+    Platform.BUTTON,
+]
 
 _PANEL_REGISTERED = False
 

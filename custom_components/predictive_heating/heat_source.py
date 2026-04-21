@@ -42,7 +42,11 @@ from .const import (
     DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_GAS_CALORIFIC_VALUE,
     DEFAULT_HEAT_SHARE,
+    MAX_SPIKE_DURATION_S,
     MIN_GAS_DT_SECONDS,
+    SPIKE_EXPECTED_DT_RATIO,
+    SPIKE_POWER_W,
+    SPIKE_WINDOW_S,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -64,6 +68,18 @@ class GasHeatSource:
     # provide the current gas reading itself.
     _last_power_w: float = field(default=0.0, init=False, repr=False)
     _last_power_ts: float = field(default=0.0, init=False, repr=False)
+    # ─── Spike (cooking / shower) rejection ──────────────────────
+    # Rolling window of (timestamp, power_w, dT_since_last_obs) tuples
+    # used to decide whether the current gas consumption is actually
+    # heating the room. When we decide it isn't, ``_in_spike`` is
+    # flipped and ``current_power_w`` returns 0 until the spike
+    # resolves (power drops below threshold OR window timer expires).
+    _spike_samples: list = field(default_factory=list, init=False, repr=False)
+    _in_spike: bool = field(default=False, init=False, repr=False)
+    _spike_since_ts: float = field(default=0.0, init=False, repr=False)
+    # Diagnostic counters
+    _spike_events: int = field(default=0, init=False, repr=False)
+    _spike_energy_mj: float = field(default=0.0, init=False, repr=False)
 
     # --------------------------------------------------------------
 
@@ -72,6 +88,75 @@ class GasHeatSource:
         self._last_ts = None
         self._last_power_w = 0.0
         self._last_power_ts = 0.0
+        self._spike_samples = []
+        self._in_spike = False
+        self._spike_since_ts = 0.0
+
+    # ── Spike tracking ────────────────────────────────────────────
+    def record_heating_result(
+        self,
+        *,
+        dT_observed: float,
+        dT_predicted: float,
+        timestamp: float | None = None,
+    ) -> None:
+        """Called once per model update cycle with the observed vs
+        predicted temperature change, so the filter can decide whether
+        the last gas pulse was really heating the room.
+
+        * ``dT_observed``: actual room dT (°C) over the update window.
+        * ``dT_predicted``: what the current thermal model expected
+           given the *raw* gas power.
+
+        If the ratio dT_observed / dT_predicted stays below
+        ``SPIKE_EXPECTED_DT_RATIO`` while the power is high, we flag a
+        spike and zero out the heat input used by the EKF.
+        """
+        now = timestamp if timestamp is not None else time.time()
+        self._spike_samples.append(
+            {
+                "ts": now,
+                "power_w": self._last_power_w,
+                "dT_obs": dT_observed,
+                "dT_pred": dT_predicted,
+            }
+        )
+        # Keep samples within the detection window only.
+        cutoff = now - SPIKE_WINDOW_S
+        self._spike_samples = [
+            s for s in self._spike_samples if s["ts"] >= cutoff
+        ]
+
+        high_power_total = sum(
+            max(s["power_w"] - SPIKE_POWER_W, 0.0) for s in self._spike_samples
+        )
+        obs_total = sum(max(s["dT_obs"], 0.0) for s in self._spike_samples)
+        pred_total = sum(max(s["dT_pred"], 1e-6) for s in self._spike_samples)
+
+        # Entering a spike: high gas power, but room didn't warm.
+        if (
+            not self._in_spike
+            and high_power_total > 0
+            and obs_total < SPIKE_EXPECTED_DT_RATIO * pred_total
+            and self._last_power_w > SPIKE_POWER_W
+        ):
+            self._in_spike = True
+            self._spike_since_ts = now
+            self._spike_events += 1
+            _LOGGER.debug(
+                "Gas spike detected: power=%.0f W, dT_obs=%.3f, "
+                "dT_pred=%.3f — attributing to DHW/cooking, not heating",
+                self._last_power_w, obs_total, pred_total,
+            )
+
+        # Leaving a spike: power dropped OR max duration exceeded OR
+        # room starts warming up again.
+        if self._in_spike:
+            max_expired = (now - self._spike_since_ts) > MAX_SPIKE_DURATION_S
+            power_low = self._last_power_w < SPIKE_POWER_W / 2
+            ratio_ok = obs_total >= SPIKE_EXPECTED_DT_RATIO * pred_total
+            if max_expired or power_low or ratio_ok:
+                self._in_spike = False
 
     def update_reading(
         self,
@@ -124,17 +209,30 @@ class GasHeatSource:
 
     def current_power_w(self, stale_after_s: float = 900.0) -> float:
         """
-        Return the most recently measured heat power (W).
-
-        If no fresh reading is available within ``stale_after_s``, we
-        assume the boiler is idle and return 0.0.
+        Return the most recently measured heat power (W) *usable as
+        space-heating input*. Returns 0 during a detected cooking /
+        shower spike, even if raw gas usage is high.
         """
         if self._last_power_ts == 0.0:
             return 0.0
         age = time.time() - self._last_power_ts
         if age > stale_after_s:
             return 0.0
+        if self._in_spike:
+            return 0.0
         return self._last_power_w
+
+    def raw_power_w(self) -> float:
+        """Last measured gross gas power (W), ignoring spike gating."""
+        return self._last_power_w
+
+    @property
+    def in_spike(self) -> bool:
+        return self._in_spike
+
+    @property
+    def spike_events(self) -> int:
+        return self._spike_events
 
     # --------------------------------------------------------------
 
@@ -147,6 +245,9 @@ class GasHeatSource:
             "last_ts": self._last_ts,
             "last_power_w": self._last_power_w,
             "last_power_ts": self._last_power_ts,
+            "spike_events": self._spike_events,
+            "in_spike": self._in_spike,
+            "spike_since_ts": self._spike_since_ts,
         }
 
     @classmethod
@@ -162,4 +263,7 @@ class GasHeatSource:
         src._last_ts = data.get("last_ts")
         src._last_power_w = data.get("last_power_w", 0.0)
         src._last_power_ts = data.get("last_power_ts", 0.0)
+        src._spike_events = int(data.get("spike_events", 0))
+        src._in_spike = bool(data.get("in_spike", False))
+        src._spike_since_ts = float(data.get("spike_since_ts", 0.0))
         return src

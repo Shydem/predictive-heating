@@ -55,13 +55,18 @@ from .const import (
     CONF_MPC_ENABLED,
     CONF_MPC_HORIZON_MIN,
     CONF_MPC_STEP_MIN,
+    CONF_OCCUPANCY_ENTITY,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
+    CONF_OVERRIDE_ENTITY,
     CONF_PERSON_ENTITIES,
     CONF_ROOM_NAME,
     CONF_SCHEDULE_ENTITY,
+    CONF_SCHEDULE_OFF_PRESET,
     CONF_SCHEDULE_OFF_TEMP,
+    CONF_SCHEDULE_ON_PRESET,
     CONF_SCHEDULE_ON_TEMP,
     CONF_TEMPERATURE_SENSOR,
+    CONF_THERMAL_COUPLINGS,
     CONF_WEATHER_ENTITY,
     CONF_WINDOW_SENSORS,
     DEFAULT_AWAY_GRACE_MIN,
@@ -72,11 +77,16 @@ from .const import (
     DEFAULT_ECO_TEMP,
     DEFAULT_GAS_CALORIFIC_VALUE,
     DEFAULT_HEAT_SHARE,
+    DEFAULT_IDLE_MIN_TEMP,
     DEFAULT_MPC_CONTROL_DELAY_MIN,
     DEFAULT_MPC_ENABLED,
     DEFAULT_MPC_HORIZON_MIN,
     DEFAULT_MPC_STEP_MIN,
+    DEFAULT_SCHEDULE_OFF_PRESET,
+    DEFAULT_SCHEDULE_ON_PRESET,
+    DEFAULT_WINDOW_OPEN_TEMP,
     DOMAIN,
+    PREDICTION_HORIZON_HOURS,
     UPDATE_INTERVAL,
 )
 from .controller import HeatingAction, HeatingController, PresetMode
@@ -84,8 +94,8 @@ from .heat_source import GasHeatSource
 from .mpc import MPCConfig
 from .preheat import PreheatConfig, PreheatPlan, PreheatPlanner
 from .presence import PresenceConfig, PresenceMonitor
-from .solar import estimate_solar_irradiance
-from .thermal_model import ThermalModel, ThermalObservation
+from .solar import estimate_solar_irradiance, get_solar_calculation
+from .thermal_model import CouplingSpec, ThermalModel, ThermalObservation
 from .zone import HeatingZone
 
 _LOGGER = logging.getLogger(__name__)
@@ -129,6 +139,7 @@ class PredictiveHeatingClimate(ClimateEntity):
         PresetMode.AWAY,
         PresetMode.SLEEP,
         PresetMode.BOOST,
+        PresetMode.VACATION,
     ]
     _attr_min_temp = 5.0
     _attr_max_temp = 30.0
@@ -167,11 +178,23 @@ class PredictiveHeatingClimate(ClimateEntity):
                 CONF_MPC_CONTROL_DELAY_MIN, DEFAULT_MPC_CONTROL_DELAY_MIN
             )),
         )
+        # Preset number entities share a dict with us via
+        # hass.data[DOMAIN][entry_id]["preset_temps"]. We pass it in to
+        # the controller so preset changes flow through automatically.
+        data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        self._preset_temps = data.setdefault("preset_temps", {})
+        self._room_data = data
         self._controller = HeatingController(
             model,
             mpc_enabled=mpc_enabled,
             mpc_config=mpc_config,
+            preset_temps_source=self._preset_temps,
         )
+        # Register callbacks so the preset-number / override / simulate
+        # platforms can find us.
+        data["_on_preset_update"] = self._on_preset_number_update
+        data["_on_override_change"] = self._on_override_change
+        data["_on_simulate_request"] = self._simulate_schedule
         self._preheat_planner = PreheatPlanner(
             model,
             PreheatConfig(
@@ -235,6 +258,10 @@ class PredictiveHeatingClimate(ClimateEntity):
             saved = getattr(model, "_heat_source_state", None)
             if saved:
                 self._heat_source = GasHeatSource.from_dict(saved)
+            # Publish the heat source on the shared data dict so the
+            # sensor platform (and any future platform) can read it
+            # without a back-reference to this climate entity.
+            data["heat_source"] = self._heat_source
 
         # State
         self._hvac_mode = HVACMode.HEAT
@@ -257,6 +284,20 @@ class PredictiveHeatingClimate(ClimateEntity):
             options.get(CONF_SCHEDULE_ENTITY)
             or config.get(CONF_SCHEDULE_ENTITY)
         )
+        self._schedule_on_preset = str(
+            options.get(
+                CONF_SCHEDULE_ON_PRESET,
+                config.get(CONF_SCHEDULE_ON_PRESET, DEFAULT_SCHEDULE_ON_PRESET),
+            )
+        )
+        self._schedule_off_preset = str(
+            options.get(
+                CONF_SCHEDULE_OFF_PRESET,
+                config.get(CONF_SCHEDULE_OFF_PRESET, DEFAULT_SCHEDULE_OFF_PRESET),
+            )
+        )
+        # Legacy temperature fields — used only as a last-resort fallback
+        # when the user hasn't configured the matching preset number.
         self._schedule_on_temp = float(
             options.get(
                 CONF_SCHEDULE_ON_TEMP,
@@ -271,6 +312,35 @@ class PredictiveHeatingClimate(ClimateEntity):
         )
         self._schedule_active_state: str | None = None
         self._schedule_override_temp: float | None = None
+
+        # Override + occupancy entities
+        self._override_entity_id: str | None = (
+            options.get(CONF_OVERRIDE_ENTITY)
+            or config.get(CONF_OVERRIDE_ENTITY)
+        )
+        self._occupancy_entity_id: str | None = (
+            options.get(CONF_OCCUPANCY_ENTITY)
+            or config.get(CONF_OCCUPANCY_ENTITY)
+        )
+        self._override_on = False
+
+        # Multi-room coupling spec (list of dicts from the config entry).
+        coupling_cfg = (
+            options.get(CONF_THERMAL_COUPLINGS)
+            or config.get(CONF_THERMAL_COUPLINGS)
+            or []
+        )
+        if coupling_cfg and not model.couplings:
+            from .const import DEFAULT_COUPLING_U
+            model.couplings = [
+                CouplingSpec(
+                    neighbour_entry_id=c["neighbour_entry_id"],
+                    u_value=float(c.get("u_value", DEFAULT_COUPLING_U)),
+                    enabled=bool(c.get("enabled", True)),
+                )
+                for c in coupling_cfg
+                if isinstance(c, dict) and c.get("neighbour_entry_id")
+            ]
 
         # Entity attributes
         self._attr_unique_id = f"predictive_heating_{entry.entry_id}"
@@ -354,6 +424,30 @@ class PredictiveHeatingClimate(ClimateEntity):
                     self.hass,
                     [self._schedule_entity_id],
                     self._async_schedule_changed,
+                )
+            )
+
+        # Track user-configured override entity (e.g. input_boolean)
+        if self._override_entity_id:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass,
+                    [self._override_entity_id],
+                    self._async_override_entity_changed,
+                )
+            )
+            init_state = self.hass.states.get(self._override_entity_id)
+            if init_state is not None:
+                self._override_on = init_state.state == "on"
+                self._room_data["override_on"] = self._override_on
+
+        # Track occupancy binary sensor (motion / presence)
+        if self._occupancy_entity_id:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass,
+                    [self._occupancy_entity_id],
+                    self._async_occupancy_changed,
                 )
             )
 
@@ -508,12 +602,18 @@ class PredictiveHeatingClimate(ClimateEntity):
 
     def _apply_schedule_state(self, state) -> None:
         """
-        Update the cached schedule state + delegate target selection
-        to the preheat planner.
+        Update the cached schedule state.
 
-        When the schedule exposes a per-slot ``temperature`` attribute
-        (newer HA versions), we treat that as the "high" target and
-        keep the user-configured off-temp as the fallback "low" target.
+        The schedule is treated as a *mode selector*:
+          * If it exposes a ``preset`` attribute (e.g. ``comfort``,
+            ``sleep``), that preset is activated on the controller.
+          * Otherwise the on/off state selects the configured on- /
+            off-preset (``schedule_on_preset`` / ``schedule_off_preset``).
+
+        The actual °C for the chosen preset comes from the per-room
+        preset number entities — not from the schedule. This eliminates
+        the old conflict where a schedule's ``temperature`` attribute
+        could disagree with the comfort preset setpoint.
         """
         if state is None:
             self._schedule_active_state = None
@@ -524,12 +624,36 @@ class PredictiveHeatingClimate(ClimateEntity):
         s = state.state
         self._schedule_active_state = s
 
+        # If the schedule still exposes a numeric temperature attribute
+        # we keep it around for diagnostics, but it is NOT used as the
+        # target any more.
         override = state.attributes.get("temperature")
         try:
             override_val = float(override) if override is not None else None
         except (TypeError, ValueError):
             override_val = None
         self._schedule_override_temp = override_val
+
+        # Select the preset that this schedule slot represents.
+        preset_attr = state.attributes.get("preset")
+        chosen_preset: str | None = None
+        if preset_attr:
+            chosen_preset = str(preset_attr).lower()
+        elif s == "on":
+            chosen_preset = self._schedule_on_preset
+        elif s == "off":
+            chosen_preset = self._schedule_off_preset
+
+        # Apply unless the user has an override / WFH switch engaged.
+        if chosen_preset and not self._override_on:
+            try:
+                preset_enum = PresetMode(chosen_preset)
+            except ValueError:
+                preset_enum = None
+            if preset_enum is not None and self._preset_mode != preset_enum:
+                self._preset_mode = preset_enum
+                self._controller.set_preset(preset_enum)
+                self._target_temp = self._controller.state.target_temp
 
         self._apply_preheat_plan()
 
@@ -539,13 +663,22 @@ class PredictiveHeatingClimate(ClimateEntity):
         return self._schedule_active_state == "on"
 
     def _schedule_targets(self) -> tuple[float, float]:
-        """Return (low_target, high_target) for the current schedule."""
-        high = (
-            self._schedule_override_temp
-            if self._schedule_override_temp is not None
-            else self._schedule_on_temp
-        )
-        low = self._schedule_off_temp
+        """Return (low_target, high_target) for the current schedule.
+
+        Uses the preset-number dict as the source of truth, falling
+        back to the legacy per-schedule temperature fields when no
+        matching preset number is configured.
+        """
+
+        def _preset_temp(slug: str, fallback: float) -> float:
+            val = self._preset_temps.get(slug)
+            try:
+                return float(val) if val is not None else fallback
+            except (TypeError, ValueError):
+                return fallback
+
+        high = _preset_temp(self._schedule_on_preset, self._schedule_on_temp)
+        low = _preset_temp(self._schedule_off_preset, self._schedule_off_temp)
         return low, high
 
     def _schedule_next_transition_ts(self) -> float | None:
@@ -648,6 +781,184 @@ class PredictiveHeatingClimate(ClimateEntity):
         """Person entity state changed → re-evaluate presence."""
         self._evaluate_presence()
 
+    # ── Override + occupancy wiring ─────────────────────────────
+
+    @callback
+    def _async_override_entity_changed(self, event) -> None:
+        """An external HA entity is being used as override source."""
+        new_state = event.data.get("new_state")
+        if new_state is None:
+            return
+        new_on = new_state.state == "on"
+        if new_on == self._override_on:
+            return
+        self._on_override_change(new_on)
+
+    @callback
+    def _async_occupancy_changed(self, event) -> None:
+        """Binary occupancy sensor — when on, force comfort preset."""
+        new_state = event.data.get("new_state")
+        if new_state is None:
+            return
+        if new_state.state == "on" and self._preset_mode != PresetMode.COMFORT:
+            self._preset_mode = PresetMode.COMFORT
+            self._controller.set_preset(PresetMode.COMFORT)
+            self._target_temp = self._controller.state.target_temp
+            self._run_control_loop()
+            self.async_write_ha_state()
+
+    def _on_override_change(self, is_on: bool) -> None:
+        """Called by the override switch or the external override entity."""
+        self._override_on = bool(is_on)
+        self._room_data["override_on"] = self._override_on
+        if is_on:
+            # Force comfort preset — remember the previous one so we
+            # can restore it cleanly on release.
+            self._room_data["_pre_override_preset"] = str(self._preset_mode)
+            self._preset_mode = PresetMode.COMFORT
+            self._controller.set_preset(PresetMode.COMFORT)
+        else:
+            # Restore whatever the schedule / user had before.
+            prev = self._room_data.pop("_pre_override_preset", None)
+            if prev is not None:
+                try:
+                    self._preset_mode = PresetMode(prev)
+                    self._controller.set_preset(self._preset_mode)
+                except ValueError:
+                    pass
+            # Re-apply the schedule so the off-preset kicks back in.
+            if self._schedule_entity_id:
+                self._apply_schedule_state(
+                    self.hass.states.get(self._schedule_entity_id)
+                )
+        self._target_temp = self._controller.state.target_temp
+        self._run_control_loop()
+        self.async_write_ha_state()
+
+    def _on_preset_number_update(self, slug: str, value: float) -> None:
+        """The user moved a preset-number slider."""
+        # If the controller's active preset is the one just changed,
+        # push the new value into target_temp immediately.
+        current_preset = str(self._preset_mode)
+        if slug == current_preset:
+            self._controller.refresh_target_from_preset()
+            self._target_temp = self._controller.state.target_temp
+            self._run_control_loop()
+            self.async_write_ha_state()
+
+    # ── Simulation hook (force-compute button) ──────────────────
+
+    async def _simulate_schedule(self) -> dict:
+        """Produce a rich 24-hour trajectory under the current config.
+
+        Runs the thermal model forward with:
+          * an hourly outdoor-temperature trace from the weather entity,
+          * a naive solar-irradiance trace derived from sun position,
+          * the *current* preset target as a constant setpoint,
+          * a proportional heating schedule: whenever the model
+            predicts the room will fall below target, full heat is
+            applied; whenever the model predicts target + hysteresis
+            would be exceeded, heat is zeroed.
+
+        The solar trace is crucial for the anti-overshoot requirement
+        — the simulator sees an afternoon solar boost coming and the
+        proportional heater stops earlier in the morning, so the
+        resulting trajectory doesn't overshoot when the sun hits.
+        """
+        outdoor = self._outdoor_temp if self._outdoor_temp is not None else 10.0
+        forecast = list(self._forecast_hourly)
+        if not forecast:
+            forecast = [outdoor] * 24
+        while len(forecast) < 24:
+            forecast.append(forecast[-1])
+
+        # Build a rough solar trace from sun position — the calculator
+        # returns current W/m², so we simulate 24 hourly samples by
+        # rotating the sun's elevation through the day. If numpy
+        # isn't available we just fall back to a simple shape.
+        solar_now = estimate_solar_irradiance(self.hass)
+        # Crude model: solar follows a sine bump peaking at local noon
+        # with amplitude ``solar_now`` if it's currently daytime, else
+        # reduced by 0.5. The point is only to *have* a solar shape —
+        # the exact numbers are a guide for the simulator, not ground
+        # truth.
+        import math
+        solar_trace: list[float] = []
+        now_hour = time.gmtime().tm_hour
+        peak = max(solar_now, 200.0) if solar_now > 0 else 150.0
+        for h in range(24):
+            hour = (now_hour + h) % 24
+            angle = math.pi * (hour - 6) / 12
+            if angle <= 0 or angle >= math.pi:
+                solar_trace.append(0.0)
+            else:
+                solar_trace.append(peak * math.sin(angle))
+
+        target = self._target_temp
+        hysteresis = self._controller.hysteresis
+        # Generate the heating-fraction schedule step-by-step so the
+        # controller decision uses the *simulated* temperature at each
+        # step, not a constant assumption.
+        steps = 24 * 4  # 15-minute steps
+        step_h = 0.25
+        model = self._model
+        C_watt_h = model.params.thermal_mass * 1000 / 3600 or 1.0
+
+        t = self._current_temp if self._current_temp is not None else target
+        trajectory: list[dict] = []
+        heating_on = False
+        for step in range(steps):
+            hour_offset = step * step_h
+            hour_idx = min(23, int(hour_offset))
+            t_out = forecast[hour_idx]
+            solar = solar_trace[hour_idx]
+
+            # Decide heating state with hysteresis.
+            if t < target - hysteresis:
+                heating_on = True
+            elif t > target + hysteresis:
+                heating_on = False
+            # Anti-overshoot: if solar irradiance is currently strong
+            # enough that the passive solar gain alone would lift the
+            # room, bias heating OFF. This is the emergent "don't
+            # heat when the sun is going to help" behaviour.
+            passive_dT_per_h = (
+                solar * model.params.solar_gain_factor
+                - model.params.heat_loss_coeff * (t - t_out)
+            ) / C_watt_h
+            if passive_dT_per_h > 0.5 and t > target - 0.5:
+                heating_on = False
+
+            heat_frac = 1.0 if heating_on else 0.0
+            q_heat = heat_frac * model.params.heating_power
+            q_solar = solar * model.params.solar_gain_factor
+            q_loss = model.params.heat_loss_coeff * (t - t_out)
+            dT = (q_heat + q_solar - q_loss) / C_watt_h * step_h
+            t += dT
+            trajectory.append(
+                {
+                    "t": round(hour_offset + step_h, 3),
+                    "temperature": round(t, 3),
+                    "t_outdoor": round(t_out, 2),
+                    "q_heat_w": round(q_heat, 1),
+                    "q_solar_w": round(q_solar, 1),
+                    "q_loss_w": round(q_loss, 1),
+                    "heating": heating_on,
+                }
+            )
+
+        return {
+            "generated_ts": time.time(),
+            "horizon_hours": 24.0,
+            "target_temp": target,
+            "hysteresis": hysteresis,
+            "trajectory": trajectory,
+            "initial_temp": self._current_temp,
+            "initial_outdoor": outdoor,
+            "solar_trace": solar_trace,
+            "forecast_outdoor": forecast,
+        }
+
     def _evaluate_presence(self) -> None:
         """
         Feed the monitor the latest person-entity states and react.
@@ -746,10 +1057,17 @@ class PredictiveHeatingClimate(ClimateEntity):
 
         # If a gas meter is configured, use its derivative for the actual
         # thermal watts delivered since the last sample — much richer
-        # than the old binary on/off.
+        # than the old binary on/off. ``current_power_w()`` already
+        # filters out cooking / shower spikes.
         measured_heat_w: float | None = None
         if self._heat_source is not None:
             measured_heat_w = self._heat_source.current_power_w()
+
+        # Coupling: sum heat flowing in from neighbouring rooms (positive
+        # means neighbour is warmer → heat flows IN). The EKF treats this
+        # as extra known "heat-in" so it doesn't confuse neighbour
+        # warming for an unusually low H.
+        coupling_power_w = self._compute_coupling_power_w()
 
         # Feed observation to thermal model (EKF learns from this)
         obs = ThermalObservation(
@@ -759,8 +1077,37 @@ class PredictiveHeatingClimate(ClimateEntity):
             heating_on=actually_heating,
             solar_irradiance=solar,
             heat_power_w=measured_heat_w,
+            coupling_power_w=coupling_power_w,
         )
         self._model.add_observation(obs)
+
+        # Spike detection: let the heat source see how the model's last
+        # prediction lined up with reality. If high gas power consistently
+        # fails to warm the room, subsequent ``current_power_w()`` calls
+        # will zero out during the spike — the EKF then stops blaming H
+        # for the missing heat.
+        if self._heat_source is not None:
+            self._heat_source.record_heating_result(
+                dT_observed=self._model.last_dT_observed,
+                dT_predicted=self._model.last_dT_predicted,
+                timestamp=obs.timestamp,
+            )
+            # Stash the latest spike-aware state into the model so the
+            # save/load round-trip picks it up across restarts.
+            self._model._heat_source_state = self._heat_source.to_dict()
+
+        # Roll an 8-hour forecast snapshot so the dashboard can later
+        # overlay "predicted 8 h ago" against observed trajectory.
+        try:
+            self._model.record_prediction_snapshot(
+                timestamp=obs.timestamp,
+                t_indoor=self._current_temp,
+                t_outdoor=outdoor,
+                solar_irradiance=solar,
+                horizon_hours=PREDICTION_HORIZON_HOURS,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Prediction snapshot failed: %s", err)
 
         # v0.3: re-evaluate presence (grace-period may have elapsed) and
         # roll the pre-heat plan forward each cycle.
@@ -771,6 +1118,46 @@ class PredictiveHeatingClimate(ClimateEntity):
 
         self._run_control_loop()
         self.async_write_ha_state()
+
+    def _compute_coupling_power_w(self) -> float:
+        """
+        Estimate heat-exchange (W) flowing into this room from coupled
+        neighbours using their current indoor temperatures.
+
+        Formula per coupling edge:
+            Q = U * (T_neighbour - T_this)     [W]
+
+        Positive = heat flows IN. A neighbour that's colder contributes
+        a negative term (heat leaves this room into the neighbour).
+
+        Only enabled couplings are counted; disabled ones let the user
+        represent "door closed" without removing the declared edge.
+        """
+        if self._current_temp is None:
+            return 0.0
+        total_w = 0.0
+        domain = self.hass.data.get(DOMAIN, {})
+        for spec in getattr(self._model, "couplings", []) or []:
+            if not spec.enabled:
+                continue
+            nb = domain.get(spec.neighbour_entry_id)
+            if not nb:
+                continue
+            nb_eid = nb.get("climate_entity_id")
+            if not nb_eid:
+                continue
+            nb_state = self.hass.states.get(nb_eid)
+            if nb_state is None:
+                continue
+            nb_temp_raw = nb_state.attributes.get("current_temperature")
+            if nb_temp_raw is None:
+                continue
+            try:
+                nb_temp = float(nb_temp_raw)
+            except (TypeError, ValueError):
+                continue
+            total_w += spec.u_value * (nb_temp - self._current_temp)
+        return total_w
 
     def _run_control_loop(self) -> None:
         """
@@ -817,22 +1204,33 @@ class PredictiveHeatingClimate(ClimateEntity):
         # calculate_setpoint() returns None when no change is due — we
         # intentionally DO NOT send a command in that case, so the
         # thermostat's OpenTherm modulation is left alone to work.
-        if self._zone.any_room_wants_heat:
+        #
+        # Key design note: even when no room *actively* wants heat, we
+        # leave the thermostat parked at the highest room-target (via
+        # HeatingZone.calculate_setpoint — which now returns the max
+        # target across rooms instead of None) so the thermostat can
+        # modulate down naturally instead of slamming to 5°C every time
+        # we hit the hysteresis top. That 5°C behaviour is reserved for
+        # the ventilation case (a window is open).
+        if self._window_open:
+            # Ventilation: force a low setpoint so the boiler does not
+            # waste gas heating an open window.
+            window_sp = self._zone.window_open_setpoint()
+            last = self._zone._last_setpoint
+            if last is None or abs(last - window_sp) > 0.1:
+                self.hass.async_create_task(
+                    self._async_set_underlying_temp(window_sp)
+                )
+                self._zone._last_setpoint = window_sp
+        else:
             setpoint = self._zone.calculate_setpoint()
             if setpoint is not None:
-                self.hass.async_create_task(
-                    self._async_set_underlying_temp(setpoint)
-                )
-        else:
-            # No room wants heat — idle the thermostat by asking for a
-            # low setpoint. Only do it once (when we first idle) so we
-            # don't spam the boiler.
-            if self._zone._last_setpoint is None or self._zone._last_setpoint > 10.0:
-                idle_setpoint = 5.0
-                self.hass.async_create_task(
-                    self._async_set_underlying_temp(idle_setpoint)
-                )
-                self._zone._last_setpoint = idle_setpoint
+                last = self._zone._last_setpoint
+                if last is None or abs(last - setpoint) > 0.05:
+                    self.hass.async_create_task(
+                        self._async_set_underlying_temp(setpoint)
+                    )
+                    self._zone._last_setpoint = setpoint
 
         # Update our HVAC action based on what the zone is actually doing
         self._update_hvac_action_from_zone()
@@ -972,6 +1370,24 @@ class PredictiveHeatingClimate(ClimateEntity):
         if self._weather_entity_id and self._forecast_hourly:
             attrs["weather_forecast_hours"] = self._forecast_hourly[:6]
 
+        # v0.5: override + coupling + simulation diagnostics
+        attrs["override_on"] = self._override_on
+        if getattr(self._model, "couplings", None):
+            attrs["thermal_couplings"] = [
+                {
+                    "neighbour_entry_id": c.neighbour_entry_id,
+                    "u_value": c.u_value,
+                    "enabled": c.enabled,
+                }
+                for c in self._model.couplings
+            ]
+        sim = self._room_data.get("last_simulation")
+        if sim:
+            attrs["last_simulation_ts"] = sim.get("generated_ts")
+        if self._heat_source is not None:
+            attrs["gas_spike_active"] = self._heat_source.in_spike
+            attrs["gas_spike_events"] = self._heat_source.spike_events
+
         return attrs
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
@@ -987,9 +1403,13 @@ class PredictiveHeatingClimate(ClimateEntity):
                 target_temp=self._target_temp,
                 wants_heat=False,
             )
-            # Only idle the thermostat if no other room in the zone wants heat
+            # Only idle the thermostat if no other room in the zone wants
+            # heat. Instead of dropping the setpoint to 5°C (which forces
+            # a large cold-start delta on the next "on" flip), we park it
+            # at the minimum configured idle temperature so the
+            # thermostat can still modulate gently.
             if not self._zone.any_room_wants_heat:
-                await self._async_set_underlying_temp(5.0)
+                await self._async_set_underlying_temp(DEFAULT_IDLE_MIN_TEMP)
                 self._zone.reset_setpoint_tracking()
         elif prev_mode == HVACMode.OFF:
             # Coming back online: drop any stale nudge history so the

@@ -569,6 +569,59 @@ def _build_room_detail(
         else None
     )
 
+    # ── Couplings (multi-room thermal connections) ──
+    couplings_out = []
+    for c in getattr(model, "couplings", []) or []:
+        nb_entry_id = getattr(c, "neighbour_entry_id", None)
+        nb_name = None
+        nb_temp = None
+        if nb_entry_id:
+            nb_data = hass.data.get(DOMAIN, {}).get(nb_entry_id)
+            if nb_data:
+                nb_name = nb_data.get("config", {}).get(CONF_ROOM_NAME)
+                nb_eid = nb_data.get("climate_entity_id")
+                if nb_eid:
+                    nb_state = hass.states.get(nb_eid)
+                    if nb_state is not None:
+                        nb_temp = _safe_float(
+                            nb_state.attributes.get("current_temperature")
+                        )
+        couplings_out.append(
+            {
+                "neighbour_entry_id": nb_entry_id,
+                "neighbour_name": nb_name,
+                "neighbour_temp": nb_temp,
+                "u_value": float(getattr(c, "u_value", 0.0) or 0.0),
+                "enabled": bool(getattr(c, "enabled", True)),
+            }
+        )
+
+    # ── Prediction history (8-hour-ago overlay) ──
+    # Keep it compact — send only the last ~60 snapshots so the payload
+    # stays small but the dashboard can still overlay a full day's
+    # worth of model-vs-reality comparisons.
+    prediction_history = list(getattr(model, "prediction_history", []))[-60:]
+
+    # ── Last simulation result (from the "Simulate" button) ──
+    last_simulation = data.get("last_simulation")
+
+    # ── Heat source / spike diagnostics ──
+    heat_source = data.get("heat_source")
+    spike_info = None
+    if heat_source is not None:
+        try:
+            spike_info = {
+                "in_spike": bool(heat_source.in_spike),
+                "spike_events": int(heat_source.spike_events),
+                "raw_power_w": round(heat_source.raw_power_w(), 1),
+                "effective_power_w": round(heat_source.current_power_w(), 1),
+            }
+        except Exception:  # noqa: BLE001
+            spike_info = None
+
+    # ── Override + occupancy ──
+    override_on = bool(data.get("override_on", False))
+
     return {
         "entry_id": entry_id,
         "room_name": config.get(CONF_ROOM_NAME, "Unknown"),
@@ -609,6 +662,18 @@ def _build_room_detail(
         "gas_meter_sensor": gas_meter_sensor,
         "boiler_efficiency": boiler_efficiency,
         "heat_share": heat_share,
+        # New — v0.5 — for the tabbed detail UI
+        "couplings": couplings_out,
+        "prediction_history": prediction_history,
+        "last_simulation": last_simulation,
+        "spike": spike_info,
+        "override_on": override_on,
+        "last_dT_observed": round(
+            float(getattr(model, "last_dT_observed", 0.0) or 0.0), 3
+        ),
+        "last_dT_predicted": round(
+            float(getattr(model, "last_dT_predicted", 0.0) or 0.0), 3
+        ),
         **zone_info,
     }
 
