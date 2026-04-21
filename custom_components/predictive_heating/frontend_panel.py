@@ -84,6 +84,10 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_delete_orphan)
     websocket_api.async_register_command(hass, ws_set_temperature)
     websocket_api.async_register_command(hass, ws_set_preset)
+    websocket_api.async_register_command(hass, ws_recompute)
+    websocket_api.async_register_command(hass, ws_simulate)
+    websocket_api.async_register_command(hass, ws_set_override)
+    websocket_api.async_register_command(hass, ws_set_coupling_enabled)
 
     _LOGGER.info("Predictive Heating dashboard registered at sidebar")
 
@@ -826,3 +830,206 @@ async def ws_set_preset(
         connection.send_error(msg["id"], "service_call_failed", str(err))
         return
     connection.send_result(msg["id"], {"ok": True})
+
+
+# ─── Advanced actions (recompute, simulate, override, couplings) ──
+#
+# These back the new tabbed dashboard. Rather than make the frontend
+# discover the button/switch entity_ids via the registry (fragile once
+# users rename things), we mirror the actions here.
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "predictive_heating/recompute",
+        vol.Required("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_recompute(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Force a full replay of stored observations through a fresh EKF."""
+    entry_id = msg["entry_id"]
+    data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if not data:
+        connection.send_error(msg["id"], "not_found", "Room not found")
+        return
+    # Lazy import — avoids pulling numpy/ekf when the dashboard
+    # never uses this endpoint.
+    from .button import _recompute_thermal_params
+
+    model = data.get("model")
+    if model is None:
+        connection.send_error(msg["id"], "no_model", "No thermal model for room")
+        return
+    try:
+        await hass.async_add_executor_job(_recompute_thermal_params, model)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.exception("Recompute failed: %s", err)
+        connection.send_error(msg["id"], "recompute_failed", str(err))
+        return
+    connection.send_result(
+        msg["id"],
+        {
+            "ok": True,
+            "params": {
+                "heat_loss_coeff": round(
+                    float(getattr(model.params, "heat_loss_coeff", 0.0) or 0.0), 2
+                ),
+                "thermal_mass": round(
+                    float(getattr(model.params, "thermal_mass", 0.0) or 0.0), 1
+                ),
+                "heating_power": round(
+                    float(getattr(model.params, "heating_power", 0.0) or 0.0), 1
+                ),
+                "solar_gain_factor": round(
+                    float(getattr(model.params, "solar_gain_factor", 0.0) or 0.0), 3
+                ),
+            },
+        },
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "predictive_heating/simulate",
+        vol.Required("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_simulate(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Run the 24h predictive simulation for this room and cache the result."""
+    entry_id = msg["entry_id"]
+    data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if not data:
+        connection.send_error(msg["id"], "not_found", "Room not found")
+        return
+    cb = data.get("_on_simulate_request")
+    if cb is None:
+        connection.send_error(
+            msg["id"],
+            "not_ready",
+            "Simulation hook not yet registered — try again after setup finishes.",
+        )
+        return
+    try:
+        result = await cb()
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.exception("Simulate failed: %s", err)
+        connection.send_error(msg["id"], "simulate_failed", str(err))
+        return
+    data["last_simulation"] = result
+    steps = 0
+    if isinstance(result, dict):
+        traj = result.get("trajectory") or []
+        try:
+            steps = len(traj)
+        except TypeError:
+            steps = 0
+    connection.send_result(msg["id"], {"ok": True, "steps": steps})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "predictive_heating/set_override",
+        vol.Required("entry_id"): str,
+        vol.Required("on"): bool,
+    }
+)
+@websocket_api.async_response
+async def ws_set_override(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Toggle the room-override flag (forces comfort preset)."""
+    entry_id = msg["entry_id"]
+    data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if not data:
+        connection.send_error(msg["id"], "not_found", "Room not found")
+        return
+    on = bool(msg["on"])
+    data["override_on"] = on
+    cb = data.get("_on_override_change")
+    if cb is not None:
+        try:
+            cb(on)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("Override callback failed: %s", err)
+    # Try to keep the HA switch entity in sync so the UI stays coherent
+    # when the user has both the panel and a regular card open.
+    try:
+        ent_reg = er.async_get(hass)
+        unique_id = f"{entry_id}_override"
+        switch_eid = ent_reg.async_get_entity_id("switch", DOMAIN, unique_id)
+        if switch_eid:
+            await hass.services.async_call(
+                "switch",
+                "turn_on" if on else "turn_off",
+                {"entity_id": switch_eid},
+                blocking=False,
+            )
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("Override switch sync failed (non-fatal): %s", err)
+    connection.send_result(msg["id"], {"ok": True, "on": on})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "predictive_heating/set_coupling_enabled",
+        vol.Required("entry_id"): str,
+        vol.Required("neighbour_entry_id"): str,
+        vol.Required("enabled"): bool,
+    }
+)
+@websocket_api.async_response
+async def ws_set_coupling_enabled(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Enable / disable one coupling edge by neighbour entry_id."""
+    entry_id = msg["entry_id"]
+    data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if not data:
+        connection.send_error(msg["id"], "not_found", "Room not found")
+        return
+    model = data.get("model")
+    if model is None or not getattr(model, "couplings", None):
+        connection.send_error(msg["id"], "no_couplings", "No couplings on this room")
+        return
+    nb_id = msg["neighbour_entry_id"]
+    enabled = bool(msg["enabled"])
+    matched = False
+    for c in model.couplings:
+        if getattr(c, "neighbour_entry_id", None) == nb_id:
+            c.enabled = enabled
+            matched = True
+            break
+    if not matched:
+        connection.send_error(
+            msg["id"], "not_found", "No coupling matches that neighbour"
+        )
+        return
+    # Keep the corresponding switch in sync as well.
+    try:
+        ent_reg = er.async_get(hass)
+        unique_id = f"{entry_id}_coupling_{nb_id}"
+        switch_eid = ent_reg.async_get_entity_id("switch", DOMAIN, unique_id)
+        if switch_eid:
+            await hass.services.async_call(
+                "switch",
+                "turn_on" if enabled else "turn_off",
+                {"entity_id": switch_eid},
+                blocking=False,
+            )
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("Coupling switch sync failed (non-fatal): %s", err)
+    connection.send_result(msg["id"], {"ok": True, "enabled": enabled})
