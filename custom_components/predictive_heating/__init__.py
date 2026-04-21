@@ -51,6 +51,17 @@ from .frontend_panel import async_register_frontend
 from .thermal_model import ThermalModel
 from .zone import ZoneManager
 
+# Pre-import platform modules so HA doesn't trip the "blocking call to
+# import_module inside the event loop" detector the first time a new
+# platform (number / switch / button) is forwarded. Since this __init__
+# itself is imported synchronously during integration load, these
+# imports all happen before any async entry-setup runs.
+from . import button as _pre_button  # noqa: F401
+from . import climate as _pre_climate  # noqa: F401
+from . import number as _pre_number  # noqa: F401
+from . import sensor as _pre_sensor  # noqa: F401
+from . import switch as _pre_switch  # noqa: F401
+
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS_LIST = [

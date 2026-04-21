@@ -700,8 +700,8 @@ class ThermalModel:
         model.prediction_history = data.get("prediction_history", [])
         model._last_obs = None
         model._heat_source_state = data.get("heat_source")
-        model.last_dT_observed = float(data.get("last_dT_observed", 0.0))
-        model.last_dT_predicted = float(data.get("last_dT_predicted", 0.0))
+        model.last_dT_observed = float(data.get("last_dT_observed") or 0.0)
+        model.last_dT_predicted = float(data.get("last_dT_predicted") or 0.0)
 
         # Couplings
         model.couplings = []

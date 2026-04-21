@@ -252,18 +252,31 @@ class GasHeatSource:
 
     @classmethod
     def from_dict(cls, data: dict) -> "GasHeatSource":
+        def _num(value, default, caster=float):
+            """Coerce stored scalars defensively: ``None``/strings fall
+            back to ``default`` instead of crashing ``from_dict`` (and,
+            by extension, platform setup)."""
+            if value is None:
+                return default
+            try:
+                return caster(value)
+            except (TypeError, ValueError):
+                return default
+
         src = cls(
-            calorific_value_mj_m3=data.get(
-                "calorific_value_mj_m3", DEFAULT_GAS_CALORIFIC_VALUE
+            calorific_value_mj_m3=_num(
+                data.get("calorific_value_mj_m3"), DEFAULT_GAS_CALORIFIC_VALUE
             ),
-            efficiency=data.get("efficiency", DEFAULT_BOILER_EFFICIENCY),
-            heat_share=data.get("heat_share", DEFAULT_HEAT_SHARE),
+            efficiency=_num(data.get("efficiency"), DEFAULT_BOILER_EFFICIENCY),
+            heat_share=_num(data.get("heat_share"), DEFAULT_HEAT_SHARE),
         )
-        src._last_m3 = data.get("last_m3")
-        src._last_ts = data.get("last_ts")
-        src._last_power_w = data.get("last_power_w", 0.0)
-        src._last_power_ts = data.get("last_power_ts", 0.0)
-        src._spike_events = int(data.get("spike_events", 0))
+        last_m3 = data.get("last_m3")
+        last_ts = data.get("last_ts")
+        src._last_m3 = _num(last_m3, None) if last_m3 is not None else None
+        src._last_ts = _num(last_ts, None) if last_ts is not None else None
+        src._last_power_w = _num(data.get("last_power_w"), 0.0)
+        src._last_power_ts = _num(data.get("last_power_ts"), 0.0)
+        src._spike_events = _num(data.get("spike_events"), 0, int)
         src._in_spike = bool(data.get("in_spike", False))
-        src._spike_since_ts = float(data.get("spike_since_ts", 0.0))
+        src._spike_since_ts = _num(data.get("spike_since_ts"), 0.0)
         return src

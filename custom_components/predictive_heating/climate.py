@@ -101,6 +101,24 @@ from .zone import HeatingZone
 _LOGGER = logging.getLogger(__name__)
 
 
+def _to_float(value, default: float) -> float:
+    """Return ``value`` as float, falling back to ``default`` for None/garbage.
+
+    Options dialogs can store ``None`` for a cleared field, and a stale
+    YAML import could leave strings or booleans in the mix. ``float(None)``
+    raises ``TypeError`` and would explode platform setup during the
+    climate entity ``__init__``, which is exactly the failure mode we saw
+    as "Error setting up entry Woonkamer for predictive_heating" with no
+    useful traceback surfaced to the frontend.
+    """
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -170,13 +188,16 @@ class PredictiveHeatingClimate(ClimateEntity):
         # ── v0.3: MPC, pre-heat, presence ─────────────────────────
         mpc_enabled = bool(options.get(CONF_MPC_ENABLED, DEFAULT_MPC_ENABLED))
         mpc_config = MPCConfig(
-            horizon_min=float(options.get(
-                CONF_MPC_HORIZON_MIN, DEFAULT_MPC_HORIZON_MIN
-            )),
-            step_min=float(options.get(CONF_MPC_STEP_MIN, DEFAULT_MPC_STEP_MIN)),
-            control_delay_min=float(options.get(
-                CONF_MPC_CONTROL_DELAY_MIN, DEFAULT_MPC_CONTROL_DELAY_MIN
-            )),
+            horizon_min=_to_float(
+                options.get(CONF_MPC_HORIZON_MIN), DEFAULT_MPC_HORIZON_MIN
+            ),
+            step_min=_to_float(
+                options.get(CONF_MPC_STEP_MIN), DEFAULT_MPC_STEP_MIN
+            ),
+            control_delay_min=_to_float(
+                options.get(CONF_MPC_CONTROL_DELAY_MIN),
+                DEFAULT_MPC_CONTROL_DELAY_MIN,
+            ),
         )
         # Preset number entities share a dict with us via
         # hass.data[DOMAIN][entry_id]["preset_temps"]. We pass it in to
@@ -215,12 +236,26 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._presence = PresenceMonitor(
             person_entities,
             PresenceConfig(
-                away_grace_min=float(options.get(
-                    CONF_AWAY_GRACE_MIN, DEFAULT_AWAY_GRACE_MIN
-                )),
+                away_grace_min=_to_float(
+                    options.get(CONF_AWAY_GRACE_MIN),
+                    DEFAULT_AWAY_GRACE_MIN,
+                ),
             ),
         )
 
+        # Required fields. Surface a *useful* error if any are missing
+        # instead of the raw ``KeyError`` that HA wraps into "Error
+        # setting up entry" with no further detail.
+        missing = [
+            k for k in (CONF_ROOM_NAME, CONF_TEMPERATURE_SENSOR, CONF_CLIMATE_ENTITY)
+            if not config.get(k)
+        ]
+        if missing:
+            raise ValueError(
+                f"predictive_heating entry {entry.entry_id} is missing "
+                f"required config field(s): {', '.join(missing)}. "
+                "Re-run the integration setup for this room to supply them."
+            )
         self._room_name = config[CONF_ROOM_NAME]
         self._temp_sensor_id = config[CONF_TEMPERATURE_SENSOR]
         self._climate_entity_id = config[CONF_CLIMATE_ENTITY]
@@ -241,17 +276,20 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._heat_source: GasHeatSource | None = None
         if self._gas_sensor_id:
             self._heat_source = GasHeatSource(
-                calorific_value_mj_m3=(
+                calorific_value_mj_m3=_to_float(
                     options.get(CONF_GAS_CALORIFIC_VALUE)
-                    or config.get(CONF_GAS_CALORIFIC_VALUE, DEFAULT_GAS_CALORIFIC_VALUE)
+                    or config.get(CONF_GAS_CALORIFIC_VALUE),
+                    DEFAULT_GAS_CALORIFIC_VALUE,
                 ),
-                efficiency=(
+                efficiency=_to_float(
                     options.get(CONF_BOILER_EFFICIENCY)
-                    or config.get(CONF_BOILER_EFFICIENCY, DEFAULT_BOILER_EFFICIENCY)
+                    or config.get(CONF_BOILER_EFFICIENCY),
+                    DEFAULT_BOILER_EFFICIENCY,
                 ),
-                heat_share=(
+                heat_share=_to_float(
                     options.get(CONF_HEAT_SHARE)
-                    or config.get(CONF_HEAT_SHARE, DEFAULT_HEAT_SHARE)
+                    or config.get(CONF_HEAT_SHARE),
+                    DEFAULT_HEAT_SHARE,
                 ),
             )
             # Restore last reading state from the model, if persisted.
@@ -298,17 +336,15 @@ class PredictiveHeatingClimate(ClimateEntity):
         )
         # Legacy temperature fields — used only as a last-resort fallback
         # when the user hasn't configured the matching preset number.
-        self._schedule_on_temp = float(
-            options.get(
-                CONF_SCHEDULE_ON_TEMP,
-                options.get("comfort_temp", DEFAULT_COMFORT_TEMP),
-            )
+        self._schedule_on_temp = _to_float(
+            options.get(CONF_SCHEDULE_ON_TEMP)
+            or options.get("comfort_temp"),
+            DEFAULT_COMFORT_TEMP,
         )
-        self._schedule_off_temp = float(
-            options.get(
-                CONF_SCHEDULE_OFF_TEMP,
-                options.get("eco_temp", DEFAULT_ECO_TEMP),
-            )
+        self._schedule_off_temp = _to_float(
+            options.get(CONF_SCHEDULE_OFF_TEMP)
+            or options.get("eco_temp"),
+            DEFAULT_ECO_TEMP,
         )
         self._schedule_active_state: str | None = None
         self._schedule_override_temp: float | None = None
@@ -335,7 +371,7 @@ class PredictiveHeatingClimate(ClimateEntity):
             model.couplings = [
                 CouplingSpec(
                     neighbour_entry_id=c["neighbour_entry_id"],
-                    u_value=float(c.get("u_value", DEFAULT_COUPLING_U)),
+                    u_value=_to_float(c.get("u_value"), DEFAULT_COUPLING_U),
                     enabled=bool(c.get("enabled", True)),
                 )
                 for c in coupling_cfg

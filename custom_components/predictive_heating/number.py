@@ -110,10 +110,16 @@ class PresetTemperatureNumber(NumberEntity, RestoreEntity):
         self._preset_temps = preset_temps
 
         # Seed with the value from entry.options if present, else default.
-        seeded = entry.options.get(option_key, entry.data.get(option_key, default))
-        self._attr_native_value = float(seeded)
+        # Be defensive: old entries may have stored ``None`` under the key,
+        # and ``float(None)`` would otherwise crash platform setup.
+        seeded = entry.options.get(option_key, entry.data.get(option_key))
+        try:
+            seeded_val = float(seeded) if seeded is not None else float(default)
+        except (TypeError, ValueError):
+            seeded_val = float(default)
+        self._attr_native_value = seeded_val
         # Share the current value with the climate entity straight away.
-        self._preset_temps[slug] = float(seeded)
+        self._preset_temps[slug] = seeded_val
 
         self._attr_unique_id = f"{entry.entry_id}_preset_{slug}"
         self._attr_name = f"{room_name} {label}"
