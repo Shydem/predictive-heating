@@ -37,6 +37,7 @@ from .const import (
     MIN_ACTIVE_SAMPLES,
     MIN_IDLE_SAMPLES,
     STATE_CALIBRATED,
+    UPDATE_INTERVAL,
 )
 from .solar import get_solar_calculation
 
@@ -88,6 +89,7 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_simulate)
     websocket_api.async_register_command(hass, ws_set_override)
     websocket_api.async_register_command(hass, ws_set_coupling_enabled)
+    websocket_api.async_register_command(hass, ws_reset_history)
 
     _LOGGER.info("Predictive Heating dashboard registered at sidebar")
 
@@ -189,18 +191,38 @@ def _schedule_state(hass: HomeAssistant, config: dict) -> dict | None:
             "friendly_name": None,
             "next_event": None,
             "override_temp": None,
+            "active_preset": None,
             "on_temp": on_temp,
             "off_temp": off_temp,
         }
     # If the schedule's current slot carries a per-slot `temperature`
     # attribute, expose it so the dashboard can show the active value.
     override_temp = _safe_float(state.attributes.get("temperature"))
+    # Slot-level preset name (comfort/eco/sleep/…), if the user has
+    # configured the schedule in preset-mode style. We probe the same
+    # attribute aliases that climate.py recognises.
+    active_preset = (
+        state.attributes.get("preset")
+        or state.attributes.get("preset_mode")
+        or state.attributes.get("mode")
+    )
+    if not active_preset:
+        data_blob = state.attributes.get("data")
+        if isinstance(data_blob, dict):
+            active_preset = (
+                data_blob.get("preset")
+                or data_blob.get("preset_mode")
+                or data_blob.get("mode")
+            )
+    if active_preset:
+        active_preset = str(active_preset).strip().lower()
     return {
         "entity_id": schedule_id,
         "state": state.state,
         "friendly_name": state.attributes.get("friendly_name"),
         "next_event": state.attributes.get("next_event"),
         "override_temp": override_temp,
+        "active_preset": active_preset or None,
         "on_temp": on_temp,
         "off_temp": off_temp,
     }
@@ -322,13 +344,21 @@ def _build_room_overview(
             and leader_name is not None
             and leader_name != this_room_name
         )
+        # ``any_room_wants_heat`` is an early indicator: even before the
+        # underlying thermostat's hvac_action updates, if a sibling room
+        # has just asked for heat, the boiler is about to fire and every
+        # radiator on this circuit will get warm. Exposing it here lets
+        # the frontend show "Heating" immediately for every room in the
+        # zone instead of waiting for the thermostat ACK.
+        any_wants = getattr(zone, "any_room_wants_heat", False)
         zone_info = {
             "zone_id": zone.zone_id,
             "zone_rooms": zone.room_names,
             "zone_is_heating": zone.is_heating,
+            "zone_any_room_wants_heat": any_wants,
             "zone_setpoint": zone._last_setpoint,
             "zone_leader_room": leader_name,
-            "co_heated_by_zone": co_heated,
+            "co_heated_by_zone": co_heated or (any_wants and not zone.is_heating),
         }
 
     window = _room_window_state(hass, config)
@@ -540,14 +570,16 @@ def _build_room_detail(
         leader = zone.leading_room
         leader_name = leader.room_name if leader else None
         this_room_name = config.get(CONF_ROOM_NAME, "Unknown")
+        any_wants = getattr(zone, "any_room_wants_heat", False)
         zone_info = {
             "zone_id": zone.zone_id,
             "zone_rooms": zone.room_names,
             "zone_is_heating": zone.is_heating,
+            "zone_any_room_wants_heat": any_wants,
             "zone_setpoint": zone._last_setpoint,
             "zone_leader_room": leader_name,
             "co_heated_by_zone": (
-                zone.is_heating
+                (zone.is_heating or any_wants)
                 and leader_name is not None
                 and leader_name != this_room_name
             ),
@@ -678,6 +710,10 @@ def _build_room_detail(
         "last_dT_predicted": round(
             float(getattr(model, "last_dT_predicted", 0.0) or 0.0), 3
         ),
+        # Time window (in seconds) over which the ΔT values are measured
+        # — exposed so the dashboard can show °C/min instead of a bare
+        # ΔT that's meaningless without knowing the tick length.
+        "update_interval_s": int(UPDATE_INTERVAL),
         **zone_info,
     }
 
@@ -979,6 +1015,45 @@ async def ws_set_override(
     except Exception as err:  # noqa: BLE001
         _LOGGER.debug("Override switch sync failed (non-fatal): %s", err)
     connection.send_result(msg["id"], {"ok": True, "on": on})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "predictive_heating/reset_history",
+        vol.Required("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_reset_history(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Wipe all stored observations + EKF state for this room.
+
+    Use this as the "recompute can't save me" fallback — when the
+    recorded history is itself bad (sensor stuck at 0, month of
+    broken readings), recomputing just replays garbage. Wiping the
+    history forces a clean relearn.
+    """
+    entry_id = msg["entry_id"]
+    data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if not data:
+        connection.send_error(msg["id"], "not_found", "Room not found")
+        return
+    model = data.get("model")
+    if model is None:
+        connection.send_error(msg["id"], "no_model", "No thermal model for room")
+        return
+    from .button import _reset_thermal_history
+
+    try:
+        n = await hass.async_add_executor_job(_reset_thermal_history, model)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.exception("Reset history failed: %s", err)
+        connection.send_error(msg["id"], "reset_failed", str(err))
+        return
+    connection.send_result(msg["id"], {"ok": True, "discarded": int(n)})
 
 
 @websocket_api.websocket_command(

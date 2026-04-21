@@ -41,8 +41,10 @@ from .const import (
     CONF_SCHEDULE_OFF_TEMP,
     CONF_SCHEDULE_ON_TEMP,
     CONF_TEMPERATURE_SENSOR,
+    CONF_THERMAL_COUPLINGS,
     CONF_WEATHER_ENTITY,
     CONF_WINDOW_SENSORS,
+    DEFAULT_COUPLING_U,
     DEFAULT_AWAY_GRACE_MIN,
     DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_BUILDING_TYPE,
@@ -221,6 +223,23 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
+        """Root options step — show menu between main settings and couplings.
+
+        Splitting the options flow into a menu keeps the main form from
+        growing unbounded as we add per-room features. The coupling editor
+        also depends on *other* configured rooms, which don't exist at the
+        time the first room is created via ``async_step_user`` — the menu
+        lets the user come back later to wire them up.
+        """
+        return self.async_show_menu(
+            step_id="init",
+            menu_options=["main", "couplings"],
+        )
+
+    async def async_step_main(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
         """Manage room name, temperature presets, and setpoint limits."""
         # Fields that live on entry.data (room identity), not in options.
         # Everything else (window sensors, gas sensor, temps…) goes to options
@@ -255,10 +274,15 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                     title=title,
                 )
 
-            # Strip entry.data fields out of options.
-            options_to_save = {
-                k: v for k, v in user_input.items() if k not in _DATA_FIELDS
-            }
+            # Strip entry.data fields out of options, then merge the rest
+            # onto the existing options so keys that live exclusively in
+            # other steps (e.g. CONF_THERMAL_COUPLINGS from async_step_couplings)
+            # are not clobbered when the user saves the main form.
+            options_to_save = dict(self.config_entry.options)
+            for k, v in user_input.items():
+                if k in _DATA_FIELDS:
+                    continue
+                options_to_save[k] = v
             return self.async_create_entry(title="", data=options_to_save)
 
         data = self.config_entry.data
@@ -540,6 +564,135 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
         )
 
         return self.async_show_form(
-            step_id="init",
+            step_id="main",
             data_schema=vol.Schema(schema_dict),
+        )
+
+    async def async_step_couplings(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Edit thermal couplings to neighbouring rooms.
+
+        For every *other* predictive-heating config entry we render two
+        fields:
+
+          * ``couple_<entry_id>_enabled`` — whether heat exchange with
+            this neighbour is modelled at all.
+          * ``couple_<entry_id>_u`` — the conductance in W/K (how "open"
+            the partition is — closed solid door ≈ 10 W/K, glazed door
+            ≈ 20–40, open doorway ≈ 60–120).
+
+        On submit we serialise to a list of
+        ``{"neighbour_entry_id", "enabled", "u_value"}`` dicts under
+        ``CONF_THERMAL_COUPLINGS`` in the entry's options. The rest of
+        the integration only consults enabled rows with u_value > 0, so
+        the user can keep defaults around without having them affect the
+        model.
+        """
+        # Build the list of neighbour entries once per render so we know
+        # which keys to read back when the user submits the form.
+        neighbours: list[tuple[str, str]] = []
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            if entry.entry_id == self.config_entry.entry_id:
+                continue
+            # ``entry.title`` is the room name (see async_step_user).
+            title = entry.title or entry.data.get(CONF_ROOM_NAME) or entry.entry_id
+            neighbours.append((entry.entry_id, title))
+        neighbours.sort(key=lambda pair: pair[1].lower())
+
+        if user_input is not None:
+            couplings: list[dict[str, Any]] = []
+            for entry_id, _title in neighbours:
+                enabled = bool(user_input.get(f"couple_{entry_id}_enabled", False))
+                try:
+                    u_value = float(
+                        user_input.get(f"couple_{entry_id}_u", DEFAULT_COUPLING_U)
+                    )
+                except (TypeError, ValueError):
+                    u_value = DEFAULT_COUPLING_U
+                # Clamp — the schema already does this via selector bounds,
+                # but be defensive since options flow input is essentially
+                # user-controlled JSON.
+                u_value = max(0.0, min(500.0, u_value))
+                couplings.append(
+                    {
+                        "neighbour_entry_id": entry_id,
+                        "enabled": enabled,
+                        "u_value": u_value,
+                    }
+                )
+
+            # Merge with whatever else was already in options — we must
+            # not blow away unrelated keys by returning only couplings.
+            new_options = dict(self.config_entry.options)
+            new_options[CONF_THERMAL_COUPLINGS] = couplings
+            return self.async_create_entry(title="", data=new_options)
+
+        # No other rooms configured — show an empty form with a note.
+        if not neighbours:
+            return self.async_show_form(
+                step_id="couplings",
+                data_schema=vol.Schema({}),
+                description_placeholders={
+                    "info": (
+                        "No other rooms are configured yet. Add another "
+                        "Predictive Heating room first, then come back here "
+                        "to link them thermally."
+                    )
+                },
+                errors={"base": "no_neighbours"},
+            )
+
+        # Build current state lookup so defaults reflect what's saved.
+        existing: dict[str, dict[str, Any]] = {}
+        for row in self.config_entry.options.get(CONF_THERMAL_COUPLINGS, []) or []:
+            nid = row.get("neighbour_entry_id")
+            if nid:
+                existing[nid] = row
+
+        schema_dict: dict[Any, Any] = {}
+        for entry_id, title in neighbours:
+            saved = existing.get(entry_id, {})
+            schema_dict[
+                vol.Optional(
+                    f"couple_{entry_id}_enabled",
+                    default=bool(saved.get("enabled", False)),
+                    description={"suggested_value": bool(saved.get("enabled", False))},
+                )
+            ] = selector.BooleanSelector()
+            schema_dict[
+                vol.Optional(
+                    f"couple_{entry_id}_u",
+                    default=float(saved.get("u_value", DEFAULT_COUPLING_U)),
+                )
+            ] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.0,
+                    max=200.0,
+                    step=1.0,
+                    unit_of_measurement="W/K",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            # A blank spacer — in HA's forms there's no header element,
+            # so we rely on field order and the label prefix ("couple_"
+            # + room name) to communicate grouping. Labels come from
+            # translations; absent those, HA shows the raw key, which
+            # is already reasonably self-describing.
+            # (No actual spacer inserted — voluptuous schemas don't
+            # support that — this comment documents intent.)
+
+        # Render labels: HA's form renderer will fall back to the raw
+        # key unless a translation file supplies a label. Provide a
+        # description_placeholders table so the template can interpolate
+        # neighbour names if the user ships a translation later.
+        placeholders = {
+            f"name_{eid}": name for eid, name in neighbours
+        }
+
+        return self.async_show_form(
+            step_id="couplings",
+            data_schema=vol.Schema(schema_dict),
+            description_placeholders=placeholders,
         )

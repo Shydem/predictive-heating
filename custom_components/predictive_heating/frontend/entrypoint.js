@@ -228,6 +228,41 @@ class PredictiveHeatingPanel extends HTMLElement {
     }
   }
 
+  async _doResetHistory(entryId) {
+    // Confirm — this is destructive and irreversible.
+    if (
+      !window.confirm(
+        "Delete ALL stored learning data for this room?\n\n" +
+          "This throws away every observation and all fitted thermal " +
+          "parameters. The model will have to relearn from scratch. " +
+          "Only do this if the stored history is unrecoverable."
+      )
+    ) {
+      return;
+    }
+    this._actionStatus = { kind: "info", text: "Resetting learning history…" };
+    this._render();
+    try {
+      const result = await this._hass.callWS({
+        type: "predictive_heating/reset_history",
+        entry_id: entryId,
+      });
+      const n = (result && result.discarded) || 0;
+      this._actionStatus = {
+        kind: "ok",
+        text: `Reset complete — discarded ${n} observations. Model will relearn.`,
+      };
+      await this._refresh();
+    } catch (e) {
+      console.error("Reset history failed:", e);
+      this._actionStatus = {
+        kind: "error",
+        text: "Reset failed: " + (e.message || e.error || e),
+      };
+      this._render();
+    }
+  }
+
   async _doSimulate(entryId) {
     this._actionStatus = { kind: "info", text: "Running 24 h simulation…" };
     this._render();
@@ -423,7 +458,12 @@ class PredictiveHeatingPanel extends HTMLElement {
 
     for (const [zoneId, roomsInZone] of zones) {
       const isMultiRoom = roomsInZone.length > 1;
-      const anyHeating = roomsInZone.some((r) => r.zone_is_heating);
+      // A zone is showing "Heating" if the thermostat is firing OR any
+      // sibling room wants heat (since that demand will propagate to
+      // every radiator on this circuit within the next update tick).
+      const anyHeating = roomsInZone.some(
+        (r) => r.zone_is_heating || r.zone_any_room_wants_heat || r.hvac_action === "heating"
+      );
       const leader =
         roomsInZone.find((r) => r.zone_leader_room)?.zone_leader_room || null;
 
@@ -465,7 +505,14 @@ class PredictiveHeatingPanel extends HTMLElement {
       : "var(--warning-color, var(--label-badge-yellow, #ff9800))";
     const progressPct = Math.min(100, this._num(room.learning_progress, 0));
 
-    const isHeating = room.zone_is_heating || room.hvac_action === "heating";
+    // Show "Heating" if the thermostat is firing, the room wants heat,
+    // or any sibling in the same zone wants heat. The sibling check
+    // matters when the shared thermostat is controlled by another room
+    // but this room's radiator is still getting hot water.
+    const isHeating =
+      room.zone_is_heating ||
+      room.zone_any_room_wants_heat === true ||
+      room.hvac_action === "heating";
     const coHeated = room.co_heated_by_zone === true;
     const windowOpen = room.window_open === true;
     const hasSchedule = !!room.schedule_entity;
@@ -512,12 +559,21 @@ class PredictiveHeatingPanel extends HTMLElement {
 
     const statusChips = [];
     if (hasSchedule) {
+      // If the schedule slot carries a preset name ("comfort", "sleep",
+      // "vacation", …) show that — it's much more informative than a
+      // bare on/off toggle, because the controller is actually driving
+      // that preset's setpoint, not the legacy schedule_on/off temps.
+      const activePreset =
+        (room.schedule && room.schedule.active_preset) || null;
+      const label = activePreset
+        ? `Schedule · ${activePreset}`
+        : `Schedule ${scheduleOn ? "ON" : "OFF"}`;
       statusChips.push(
         `<span class="chip schedule ${scheduleOn ? "on" : "off"}" title="Following ${this._escape(
           room.schedule_entity
-        )}">
+        )}${activePreset ? ` (slot preset: ${activePreset})` : ""}">
           <ha-icon icon="mdi:calendar-clock"></ha-icon>
-          Schedule ${scheduleOn ? "ON" : "OFF"}
+          ${this._escape(label)}
         </span>`
       );
     }
@@ -879,6 +935,12 @@ class PredictiveHeatingPanel extends HTMLElement {
     if (recomputeBtn) {
       recomputeBtn.addEventListener("click", () =>
         this._doRecompute(recomputeBtn.dataset.entryId)
+      );
+    }
+    const resetHistBtn = detail.querySelector("#reset-history-btn");
+    if (resetHistBtn) {
+      resetHistBtn.addEventListener("click", () =>
+        this._doResetHistory(resetHistBtn.dataset.entryId)
       );
     }
     const simulateBtn = detail.querySelector("#simulate-btn");
@@ -1343,12 +1405,18 @@ class PredictiveHeatingPanel extends HTMLElement {
         <p class="hint">
           Replay every stored observation through a fresh EKF. Use this after
           a bad period of data (e.g. a broken sensor now fixed) has dragged
-          the estimates off.
+          the estimates off. Observations that look broken (NaN, out of
+          range, 5 °C spikes) are skipped automatically.
         </p>
         <div class="action-row">
           <button class="primary-btn" id="recompute-btn" data-entry-id="${d.entry_id}">
             <ha-icon icon="mdi:calculator-variant"></ha-icon>
             Recompute thermal properties
+          </button>
+          <button class="danger-btn" id="reset-history-btn" data-entry-id="${d.entry_id}"
+                  title="Nuclear option: throws away ALL learning history and starts fresh. Use if the stored history itself is unrecoverable.">
+            <ha-icon icon="mdi:delete-forever"></ha-icon>
+            Reset learning history
           </button>
           ${this._renderStatusBadge()}
         </div>
@@ -1430,35 +1498,53 @@ class PredictiveHeatingPanel extends HTMLElement {
       `;
     }
 
-    // Last observed vs predicted ΔT (sanity check)
+    // Last observed vs predicted ΔT (sanity check).
+    // ΔT is measured across exactly one controller tick — expose that
+    // window so the value is interpretable as a *rate*, not a bare delta.
     if (lastDTObs != null || lastDTPred != null) {
+      const tickS = this._num(d.update_interval_s, 120);
+      const tickMin = tickS / 60;
+      // Convert scalar ΔT (°C per tick) to rate (°C per minute).
+      const obsRate = lastDTObs != null ? lastDTObs / tickMin : null;
+      const predRate = lastDTPred != null ? lastDTPred / tickMin : null;
+      const errRate = dTError != null ? dTError / tickMin : null;
       const errColor =
         dTError != null && dTError < 0.05
           ? "var(--success-color, #4caf50)"
           : dTError != null && dTError < 0.15
           ? "var(--warning-color, #ff9800)"
           : "var(--error-color, #f44336)";
+      const tickLabel =
+        tickMin >= 1 ? `${this._fix(tickMin, 0)} min` : `${Math.round(tickS)} s`;
       html += `
         <div class="section">
-          <h2><ha-icon icon="mdi:sigma"></ha-icon>Latest step (ΔT per update)</h2>
+          <h2><ha-icon icon="mdi:sigma"></ha-icon>Latest step (ΔT per ${tickLabel} tick)</h2>
           <p class="hint">
-            On every controller tick, the model predicts how much the indoor
-            temperature will change until the next tick and compares it to what
-            actually happened.
+            On every controller tick (${tickLabel}) the model predicts how
+            much the indoor temperature will change until the next tick and
+            compares it to what actually happened. Rates are shown in °C/min
+            so values are directly comparable across intervals.
           </p>
           <div class="predictions-grid">
             <div class="prediction-card">
-              <div class="prediction-label">Observed ΔT</div>
-              <div class="prediction-value">${this._fix(lastDTObs, 3)} °C</div>
+              <div class="prediction-label">Observed</div>
+              <div class="prediction-value">${this._fix(obsRate, 3)} °C/min</div>
+              <div class="prediction-sub">${this._fix(lastDTObs, 3)} °C over ${tickLabel}</div>
             </div>
             <div class="prediction-card">
-              <div class="prediction-label">Predicted ΔT</div>
-              <div class="prediction-value">${this._fix(lastDTPred, 3)} °C</div>
+              <div class="prediction-label">Predicted</div>
+              <div class="prediction-value">${this._fix(predRate, 3)} °C/min</div>
+              <div class="prediction-sub">${this._fix(lastDTPred, 3)} °C over ${tickLabel}</div>
             </div>
             <div class="prediction-card" style="color: ${errColor}">
               <div class="prediction-label">Abs. error</div>
               <div class="prediction-value" style="color: ${errColor}">${
-                dTError != null ? this._fix(dTError, 3) + " °C" : "—"
+                errRate != null ? this._fix(errRate, 3) + " °C/min" : "—"
+              }</div>
+              <div class="prediction-sub" style="color: ${errColor}">${
+                dTError != null
+                  ? this._fix(dTError, 3) + " °C over " + tickLabel
+                  : "—"
               }</div>
             </div>
           </div>
@@ -1484,6 +1570,8 @@ class PredictiveHeatingPanel extends HTMLElement {
           <div class="chart-legend">
             <span class="legend-item"><span class="legend-dot" style="background:var(--primary-color)"></span>Observed indoor</span>
             <span class="legend-item"><span class="legend-dot" style="background:var(--secondary-text-color, #888)"></span>Forecast from 8 h ago</span>
+            <span class="legend-item"><span class="legend-dot" style="background:var(--accent-color, #ff9800)"></span>Scheduled setpoint</span>
+            <span class="legend-item"><span class="legend-shade" style="background:var(--error-color, #f44336);opacity:0.2"></span>Heating (actual / forecast)</span>
           </div>
         </div>
       `;
@@ -1524,7 +1612,7 @@ class PredictiveHeatingPanel extends HTMLElement {
         </div>
         <div class="chart-legend">
           <span class="legend-item"><span class="legend-dot" style="background:var(--primary-color)"></span>Predicted indoor</span>
-          <span class="legend-item"><span class="legend-dot" style="background:var(--accent-color, #ff9800)"></span>Target</span>
+          <span class="legend-item"><span class="legend-dot" style="background:var(--accent-color, #ff9800)"></span>Setpoint (schedule-aware)</span>
           <span class="legend-item"><span class="legend-shade" style="background:var(--error-color, #f44336);opacity:0.2"></span>Heating</span>
         </div>
       `;
@@ -2121,6 +2209,54 @@ class PredictiveHeatingPanel extends HTMLElement {
       ctx.fillText(lbl, x, H - pad.bottom + 20);
     }
 
+    // ── Heating shading ─────────────────────────────────────
+    // Draw where the actual heating was on during the observed window,
+    // plus where the recorded forecast expected heat to flow. Both are
+    // painted underneath the lines so they don't obscure the data.
+    const heatCol = this._themeColor("--error-color", "#f44336");
+    // Observed heating (red-ish, slightly opaque).
+    ctx.fillStyle = this._withAlpha(heatCol, 0.12);
+    for (let i = 0; i < relevantObs.length - 1; i++) {
+      if (relevantObs[i].heating_on) {
+        const x1 = toX(relevantObs[i].timestamp);
+        const x2 = toX(relevantObs[i + 1].timestamp);
+        ctx.fillRect(x1, pad.top, x2 - x1, plotH);
+      }
+    }
+    // Forecasted heating (thinner hatching above, so observed vs. forecast
+    // heating are distinguishable without a separate legend key).
+    ctx.fillStyle = this._withAlpha(heatCol, 0.08);
+    for (let i = 0; i < best.trajectory.length - 1; i++) {
+      const hf = this._num(best.trajectory[i].heating_fraction, 0);
+      if (hf > 0.05) {
+        const x1 = toX(forecastT0 + this._num(best.trajectory[i].t, 0) * 3600);
+        const x2 = toX(
+          forecastT0 + this._num(best.trajectory[i + 1].t, 0) * 3600
+        );
+        ctx.fillRect(x1, pad.top + plotH * 0.5, x2 - x1, plotH * 0.5);
+      }
+    }
+
+    // Scheduled setpoint — drawn as a thin orange dashed line so the
+    // user can see where the controller was aiming. Only drawn when
+    // the snapshot actually carried a setpoint trace.
+    if (Array.isArray(best.setpoint_trace) && best.setpoint_trace.length) {
+      const accentCol = this._themeColor("--accent-color", "#ff9800");
+      ctx.strokeStyle = accentCol;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      for (let i = 0; i < best.setpoint_trace.length; i++) {
+        const t = forecastT0 + i * 3600;
+        const v = this._num(best.setpoint_trace[i], 0);
+        const x = toX(t);
+        const y = toY(v);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
     // Forecast line (dashed, gray)
     ctx.strokeStyle = forecast;
     ctx.lineWidth = 1.5;
@@ -2241,18 +2377,33 @@ class PredictiveHeatingPanel extends HTMLElement {
       }
     }
 
-    // Target line
-    if (targetTemp != null) {
-      ctx.strokeStyle = target;
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([6, 4]);
-      ctx.beginPath();
-      const ty = toY(this._num(targetTemp, 0));
-      ctx.moveTo(pad.left, ty);
-      ctx.lineTo(W - pad.right, ty);
-      ctx.stroke();
-      ctx.setLineDash([]);
+    // Target line — walk the per-step setpoint so scheduled transitions
+    // are visible as steps in the orange dashed line, rather than a
+    // single flat target.
+    ctx.strokeStyle = target;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    let drewAny = false;
+    for (let i = 0; i < traj.length; i++) {
+      const setpoint =
+        traj[i].setpoint != null
+          ? this._num(traj[i].setpoint, 0)
+          : targetTemp != null
+          ? this._num(targetTemp, 0)
+          : null;
+      if (setpoint == null) continue;
+      const x = toX(this._num(traj[i].t, 0));
+      const y = toY(setpoint);
+      if (!drewAny) {
+        ctx.moveTo(x, y);
+        drewAny = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
     }
+    if (drewAny) ctx.stroke();
+    ctx.setLineDash([]);
 
     // Indoor forecast line
     ctx.strokeStyle = indoor;
@@ -2766,6 +2917,11 @@ class PredictiveHeatingPanel extends HTMLElement {
         font-weight: 500;
         color: var(--primary-color);
       }
+      .prediction-sub {
+        font-size: 11px;
+        color: var(--secondary-text-color);
+        margin-top: 4px;
+      }
 
       /* Empty state */
       .empty-state {
@@ -3137,7 +3293,7 @@ class PredictiveHeatingPanel extends HTMLElement {
         margin: 8px 0 16px;
       }
       .error-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-      .primary-btn, .secondary-btn {
+      .primary-btn, .secondary-btn, .danger-btn {
         display: inline-flex;
         align-items: center;
         gap: 6px;
@@ -3157,7 +3313,15 @@ class PredictiveHeatingPanel extends HTMLElement {
         color: var(--primary-text-color);
         border-color: var(--divider-color, rgba(0,0,0,0.15));
       }
-      .primary-btn ha-icon, .secondary-btn ha-icon { --mdc-icon-size: 16px; }
+      .danger-btn {
+        background: transparent;
+        color: var(--error-color, #f44336);
+        border-color: var(--error-color, #f44336);
+      }
+      .danger-btn:hover {
+        background: color-mix(in srgb, var(--error-color, #f44336) 10%, transparent);
+      }
+      .primary-btn ha-icon, .secondary-btn ha-icon, .danger-btn ha-icon { --mdc-icon-size: 16px; }
 
       /* ── Tab bar ─────────────────────────────────────── */
       .tab-bar {

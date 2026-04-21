@@ -348,6 +348,10 @@ class PredictiveHeatingClimate(ClimateEntity):
         )
         self._schedule_active_state: str | None = None
         self._schedule_override_temp: float | None = None
+        # Resolved preset name for the currently active slot, or None
+        # when the schedule slot does not advertise a preset (we fall
+        # back to the on/off presets in that case).
+        self._schedule_active_preset: str | None = None
 
         # Override + occupancy entities
         self._override_entity_id: str | None = (
@@ -641,8 +645,12 @@ class PredictiveHeatingClimate(ClimateEntity):
         Update the cached schedule state.
 
         The schedule is treated as a *mode selector*:
-          * If it exposes a ``preset`` attribute (e.g. ``comfort``,
-            ``sleep``), that preset is activated on the controller.
+          * If the current slot carries a preset name (via ``preset``,
+            ``preset_mode``, ``mode`` or a nested ``data.preset``
+            attribute — HA schedules expose slot ``data`` as attributes
+            one key at a time), that preset is activated on the
+            controller. Accepted values: ``comfort``, ``eco``, ``away``,
+            ``sleep``, ``boost``, ``vacation`` (case-insensitive).
           * Otherwise the on/off state selects the configured on- /
             off-preset (``schedule_on_preset`` / ``schedule_off_preset``).
 
@@ -654,6 +662,7 @@ class PredictiveHeatingClimate(ClimateEntity):
         if state is None:
             self._schedule_active_state = None
             self._schedule_override_temp = None
+            self._schedule_active_preset = None
             self._apply_preheat_plan()
             return
 
@@ -670,23 +679,58 @@ class PredictiveHeatingClimate(ClimateEntity):
             override_val = None
         self._schedule_override_temp = override_val
 
-        # Select the preset that this schedule slot represents.
-        preset_attr = state.attributes.get("preset")
+        # Select the preset that this schedule slot represents. We look
+        # at multiple attribute spellings because HA's schedule helper
+        # has moved slot ``data`` between nested and flattened shapes
+        # across versions, and users also configure slot metadata via a
+        # ``preset_mode`` or plain ``mode`` key.
+        preset_attr = (
+            state.attributes.get("preset")
+            or state.attributes.get("preset_mode")
+            or state.attributes.get("mode")
+        )
+        # Some HA versions expose slot data under a nested ``data`` dict.
+        if not preset_attr:
+            data_blob = state.attributes.get("data")
+            if isinstance(data_blob, dict):
+                preset_attr = (
+                    data_blob.get("preset")
+                    or data_blob.get("preset_mode")
+                    or data_blob.get("mode")
+                )
+
         chosen_preset: str | None = None
         if preset_attr:
-            chosen_preset = str(preset_attr).lower()
+            chosen_preset = str(preset_attr).strip().lower()
         elif s == "on":
             chosen_preset = self._schedule_on_preset
         elif s == "off":
             chosen_preset = self._schedule_off_preset
 
         # Apply unless the user has an override / WFH switch engaged.
-        if chosen_preset and not self._override_on:
+        # ``PresetMode`` enforces a known vocabulary — unknown strings
+        # (e.g. a typo in the schedule slot) are logged and ignored
+        # rather than silently swallowing the mis-config.
+        preset_enum = None
+        if chosen_preset:
             try:
                 preset_enum = PresetMode(chosen_preset)
             except ValueError:
+                _LOGGER.warning(
+                    "Schedule %s advertised unknown preset %r — "
+                    "falling back to current preset. Valid values: "
+                    "comfort, eco, away, sleep, boost, vacation.",
+                    self._schedule_entity_id,
+                    chosen_preset,
+                )
                 preset_enum = None
-            if preset_enum is not None and self._preset_mode != preset_enum:
+
+        self._schedule_active_preset = (
+            preset_enum.value if preset_enum is not None else None
+        )
+
+        if preset_enum is not None and not self._override_on:
+            if self._preset_mode != preset_enum:
                 self._preset_mode = preset_enum
                 self._controller.set_preset(preset_enum)
                 self._target_temp = self._controller.state.target_temp
@@ -884,17 +928,113 @@ class PredictiveHeatingClimate(ClimateEntity):
 
     # ── Simulation hook (force-compute button) ──────────────────
 
+    def _preset_target_temp(self, preset: str | None) -> float | None:
+        """Resolve a preset slug → °C using the same rules as the controller.
+
+        Returns None if no value can be found. Falls back through the
+        user-configured preset-number entities first, then the built-in
+        defaults. The resolved number is what the thermostat would
+        actually target if this preset were active.
+        """
+        if not preset:
+            return None
+        slug = str(preset).strip().lower()
+        val = self._preset_temps.get(slug)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+        try:
+            return float(self._controller.preset_temps[PresetMode(slug)])
+        except (KeyError, ValueError, TypeError):
+            return None
+
+    def _build_setpoint_trace(
+        self, horizon_hours: float, step_h: float
+    ) -> list[float]:
+        """Return a per-step setpoint trace that honours the schedule.
+
+        The simulator and the 8h prediction snapshots both need to know
+        "what temperature was the controller aiming for at each step"
+        — otherwise the MPC / 24h sim will anchor to the *current*
+        target and draw a flat line through scheduled transitions,
+        which is the bug Sietse reported as "schedule is not
+        incorporated correctly".
+
+        Strategy:
+            1. Start from the current active preset/setpoint.
+            2. If the schedule entity exposes a next-transition
+               timestamp, flip to the opposite preset at that point.
+            3. Continue extrapolating a simple on/off pattern using the
+               same cycle length the schedule shows (fallback 12 h).
+            4. Without a schedule, the trace is constant at the current
+               target — same as the old behaviour.
+        """
+        steps = max(1, int(round(horizon_hours / step_h)))
+        start_target = float(self._target_temp)
+
+        # Figure out the two "modes" the schedule toggles between and
+        # their resolved °C values.
+        active_preset = self._schedule_active_preset or (
+            self._schedule_on_preset
+            if self._schedule_active_state == "on"
+            else self._schedule_off_preset
+        )
+        if self._schedule_active_state == "on":
+            other_preset = self._schedule_off_preset
+        else:
+            other_preset = self._schedule_on_preset
+
+        on_temp = (
+            self._preset_target_temp(active_preset) or start_target
+        )
+        off_temp = (
+            self._preset_target_temp(other_preset) or start_target
+        )
+
+        if not self._schedule_entity_id:
+            return [start_target] * steps
+
+        next_ts = self._schedule_next_transition_ts()
+        now = time.time()
+
+        # Pessimistic default: if we can't read a next flip, just hold
+        # the current target — better than making up transitions.
+        if next_ts is None or next_ts <= now:
+            return [start_target] * steps
+
+        first_flip_h = max(0.0, (next_ts - now) / 3600.0)
+        # Use any previously-observed cycle length, else assume 12 h
+        # (typical day/night schedule). This is only used to guess
+        # subsequent flips past the first — it is not safety-critical.
+        cycle_h = max(1.0, first_flip_h) if first_flip_h < 24 else 12.0
+
+        trace: list[float] = []
+        current_temp = on_temp  # what we're aiming at "now"
+        other_temp = off_temp
+        flip_at_h = first_flip_h
+        for step in range(steps):
+            hour_offset = step * step_h
+            while hour_offset >= flip_at_h:
+                current_temp, other_temp = other_temp, current_temp
+                flip_at_h += cycle_h
+            trace.append(current_temp)
+        return trace
+
     async def _simulate_schedule(self) -> dict:
         """Produce a rich 24-hour trajectory under the current config.
 
         Runs the thermal model forward with:
           * an hourly outdoor-temperature trace from the weather entity,
           * a naive solar-irradiance trace derived from sun position,
-          * the *current* preset target as a constant setpoint,
-          * a proportional heating schedule: whenever the model
-            predicts the room will fall below target, full heat is
-            applied; whenever the model predicts target + hysteresis
-            would be exceeded, heat is zeroed.
+          * a setpoint trace derived from the schedule (so scheduled
+            comfort→sleep→comfort transitions show up in the plan),
+          * a proportional heater that modulates between 0 and 1 based
+            on how far the room is below the setpoint. This replaces
+            the old bang-bang hysteresis which made the trajectory
+            look like a sawtooth even when the real thermostat
+            modulates smoothly around the setpoint.
 
         The solar trace is crucial for the anti-overshoot requirement
         — the simulator sees an afternoon solar boost coming and the
@@ -930,42 +1070,44 @@ class PredictiveHeatingClimate(ClimateEntity):
             else:
                 solar_trace.append(peak * math.sin(angle))
 
-        target = self._target_temp
         hysteresis = self._controller.hysteresis
-        # Generate the heating-fraction schedule step-by-step so the
-        # controller decision uses the *simulated* temperature at each
-        # step, not a constant assumption.
+        # Proportional band: open the "valve" as the room drops below
+        # setpoint, close it as it approaches/exceeds. ``band`` is the
+        # width in °C over which the heat fraction sweeps from 1→0.
+        band = max(0.4, 2 * hysteresis)
         steps = 24 * 4  # 15-minute steps
         step_h = 0.25
+        horizon_h = steps * step_h
         model = self._model
         C_watt_h = model.params.thermal_mass * 1000 / 3600 or 1.0
 
-        t = self._current_temp if self._current_temp is not None else target
+        setpoint_trace = self._build_setpoint_trace(horizon_h, step_h)
+
+        t = self._current_temp if self._current_temp is not None else setpoint_trace[0]
         trajectory: list[dict] = []
-        heating_on = False
         for step in range(steps):
             hour_offset = step * step_h
             hour_idx = min(23, int(hour_offset))
             t_out = forecast[hour_idx]
             solar = solar_trace[hour_idx]
+            target = setpoint_trace[step]
 
-            # Decide heating state with hysteresis.
-            if t < target - hysteresis:
-                heating_on = True
-            elif t > target + hysteresis:
-                heating_on = False
-            # Anti-overshoot: if solar irradiance is currently strong
-            # enough that the passive solar gain alone would lift the
-            # room, bias heating OFF. This is the emergent "don't
-            # heat when the sun is going to help" behaviour.
+            # Proportional heat fraction: below (target − band/2) →
+            # full; above (target + band/2) → zero; linear in between.
+            # This is what produces a smooth trace at the setpoint
+            # instead of the old sawtooth oscillation.
+            error = target - t  # positive → room is cold, need heat
+            heat_frac = max(0.0, min(1.0, 0.5 + error / band))
+
+            # Anti-overshoot: if the passive gain (solar − loss) is
+            # already pulling the room above target, zero out the heat.
             passive_dT_per_h = (
                 solar * model.params.solar_gain_factor
                 - model.params.heat_loss_coeff * (t - t_out)
             ) / C_watt_h
             if passive_dT_per_h > 0.5 and t > target - 0.5:
-                heating_on = False
+                heat_frac = 0.0
 
-            heat_frac = 1.0 if heating_on else 0.0
             q_heat = heat_frac * model.params.heating_power
             q_solar = solar * model.params.solar_gain_factor
             q_loss = model.params.heat_loss_coeff * (t - t_out)
@@ -976,23 +1118,26 @@ class PredictiveHeatingClimate(ClimateEntity):
                     "t": round(hour_offset + step_h, 3),
                     "temperature": round(t, 3),
                     "t_outdoor": round(t_out, 2),
+                    "setpoint": round(target, 2),
                     "q_heat_w": round(q_heat, 1),
                     "q_solar_w": round(q_solar, 1),
                     "q_loss_w": round(q_loss, 1),
-                    "heating": heating_on,
+                    "heat_fraction": round(heat_frac, 3),
+                    "heating": heat_frac > 0.05,
                 }
             )
 
         return {
             "generated_ts": time.time(),
             "horizon_hours": 24.0,
-            "target_temp": target,
+            "target_temp": setpoint_trace[0],
             "hysteresis": hysteresis,
             "trajectory": trajectory,
             "initial_temp": self._current_temp,
             "initial_outdoor": outdoor,
             "solar_trace": solar_trace,
             "forecast_outdoor": forecast,
+            "setpoint_trace": [round(s, 2) for s in setpoint_trace],
         }
 
     def _evaluate_presence(self) -> None:
@@ -1060,18 +1205,27 @@ class PredictiveHeatingClimate(ClimateEntity):
         """
         Set this room's HVAC action based on zone state.
 
-        If the zone is heating (thermostat is firing), ALL rooms in the
-        zone show "heating" — because the boiler is running and all
-        radiators on that circuit are getting hot water.
+        If the zone is heating (thermostat is firing) OR any sibling room
+        in the zone wants heat, ALL rooms in the zone show "heating" —
+        because the boiler is running and all radiators on that circuit
+        are getting hot water.
+
+        Why the ``any_room_wants_heat`` fallback matters:
+            Some underlying thermostats / TRVs don't populate the
+            ``hvac_action`` attribute reliably. Even when they do, the
+            attribute lags the actual demand by up to a minute while the
+            thermostat's own loop decides to fire. Using the zone's
+            aggregate demand as a fallback keeps the UI coherent: the
+            moment any room in the zone says "heat needed", every room
+            in the zone visibly reflects "Heating" instead of staying
+            stuck on "Idle" until the thermostat ACKs.
         """
         if self._hvac_mode == HVACMode.OFF:
             self._hvac_action = HVACAction.OFF
             return
 
-        if self._zone.is_heating:
-            self._hvac_action = HVACAction.HEATING
-        elif self._wants_heat:
-            # We want heat but thermostat hasn't started yet
+        zone_active = self._zone.is_heating or self._zone.any_room_wants_heat
+        if zone_active or self._wants_heat:
             self._hvac_action = HVACAction.HEATING
         else:
             self._hvac_action = HVACAction.IDLE
@@ -1134,13 +1288,23 @@ class PredictiveHeatingClimate(ClimateEntity):
 
         # Roll an 8-hour forecast snapshot so the dashboard can later
         # overlay "predicted 8 h ago" against observed trajectory.
+        # Feed it an hourly setpoint trace derived from the schedule,
+        # so the recorded forecast accounts for scheduled comfort/
+        # sleep/away transitions across the horizon — otherwise the
+        # overlay would silently ignore the schedule and diverge from
+        # reality after the first transition.
         try:
+            setpoint_trace = self._build_setpoint_trace(
+                horizon_hours=float(PREDICTION_HORIZON_HOURS),
+                step_h=1.0,  # one value per hour (matches snapshot granularity)
+            )
             self._model.record_prediction_snapshot(
                 timestamp=obs.timestamp,
                 t_indoor=self._current_temp,
                 t_outdoor=outdoor,
                 solar_irradiance=solar,
                 horizon_hours=PREDICTION_HORIZON_HOURS,
+                setpoint_trace=setpoint_trace,
             )
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("Prediction snapshot failed: %s", err)
@@ -1369,6 +1533,7 @@ class PredictiveHeatingClimate(ClimateEntity):
             attrs["schedule_on_temp"] = self._schedule_on_temp
             attrs["schedule_off_temp"] = self._schedule_off_temp
             attrs["schedule_override_temp"] = self._schedule_override_temp
+            attrs["schedule_active_preset"] = self._schedule_active_preset
 
         # Window detection summary
         if self._window_sensor_ids:

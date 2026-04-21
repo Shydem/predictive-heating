@@ -45,6 +45,56 @@ from .const import (
 )
 
 
+def _proportional_heat_plan(
+    *,
+    t_indoor: float,
+    setpoint_trace: list[float],
+    outdoor_trace: list[float],
+    solar_trace: list[float],
+    params,
+    hours: int,
+    band: float = 0.6,
+) -> list[float]:
+    """Derive a per-hour 0..1 heating fraction that tracks ``setpoint_trace``.
+
+    This is a simple forward-sim proportional controller. We walk the
+    temperature forward hour by hour; at each step the heating
+    fraction is scaled linearly with the error (target - temp) over
+    the proportional band. This is what produces a realistic "the
+    boiler modulated around 50% for two hours as the setpoint held"
+    recorded forecast, instead of the old "no heat ever" behaviour
+    which drifted badly after any scheduled transition.
+    """
+    p = params
+    C_watt_h = p.thermal_mass * 1000 / 3600
+    if C_watt_h <= 0 or hours <= 0:
+        return []
+
+    plan: list[float] = []
+    t = t_indoor
+    for h in range(max(1, hours)):
+        target = float(
+            setpoint_trace[min(len(setpoint_trace) - 1, h)]
+        )
+        error = target - t
+        frac = max(0.0, min(1.0, 0.5 + error / band))
+        plan.append(frac)
+        # Step the temperature forward one hour at this fraction so the
+        # next iteration's error reflects the thermal response.
+        q_heat = frac * p.heating_power
+        q_solar = (
+            solar_trace[min(len(solar_trace) - 1, h)] * p.solar_gain_factor
+            if solar_trace else 0.0
+        )
+        t_out = (
+            outdoor_trace[min(len(outdoor_trace) - 1, h)]
+            if outdoor_trace else t
+        )
+        q_loss = p.heat_loss_coeff * (t - t_out)
+        t += (q_heat + q_solar - q_loss) / C_watt_h  # 1 h step
+    return plan
+
+
 def estimate_initial_thermal_params(
     floor_area_m2: float | None,
     ceiling_height_m: float | None = None,
@@ -517,6 +567,8 @@ class ThermalModel:
         t_outdoor: float,
         solar_irradiance: float,
         horizon_hours: float = PREDICTION_HORIZON_HOURS,
+        setpoint_trace: list[float] | None = None,
+        heating_fraction_trace: list[float] | None = None,
     ) -> None:
         """
         Store a forecast curve for later comparison with reality.
@@ -524,6 +576,17 @@ class ThermalModel:
         Keeps the model's opinion of the *next* ``horizon_hours`` hours
         around so the dashboard can overlay "prediction from T-8h" on
         top of the recorded actual trajectory.
+
+        ``setpoint_trace`` is an optional per-hour target temperature
+        that lets the snapshot account for scheduled transitions (e.g.
+        the setpoint dropping to the sleep preset at 22:00). When
+        provided AND ``heating_fraction_trace`` is not, we derive a
+        simple proportional heat schedule so the recorded forecast
+        actually follows the setpoint profile — otherwise the overlay
+        would ignore the schedule entirely and drift away from reality
+        after the first scheduled transition, which is the bug Sietse
+        reported ("prediction from 8 hours ago doesn't include the
+        schedule").
         """
         # Very coarse outdoor trace — one point per hour, flat at the
         # current outdoor reading. We accept this simplification
@@ -535,16 +598,36 @@ class ThermalModel:
         # Replaced at call time by the climate entity when a richer
         # solar schedule is available.
         solar_trace = [solar_irradiance * (0.5 ** (h / 4.0)) for h in range(hours)]
-        # Assume no forced heating; the forecast traces the natural
-        # evolution if the boiler were to stay off.
+
+        # If the caller provided a setpoint trace but no explicit
+        # heating-fraction trace, build a proportional heat plan from
+        # it. This mirrors how the real controller modulates around
+        # the setpoint, so the recorded forecast tracks scheduled
+        # transitions instead of assuming "no heat" forever.
+        if heating_fraction_trace is None and setpoint_trace:
+            heating_fraction_trace = _proportional_heat_plan(
+                t_indoor=t_indoor,
+                setpoint_trace=setpoint_trace,
+                outdoor_trace=outdoor_trace,
+                solar_trace=solar_trace,
+                params=self.params,
+                hours=hours,
+            )
+
         traj = self.predict_trajectory(
             t_indoor=t_indoor,
             hours_ahead=horizon_hours,
             outdoor_trace=outdoor_trace,
             solar_trace=solar_trace,
-            heating_fraction_trace=None,
+            heating_fraction_trace=heating_fraction_trace,
             step_minutes=15.0,
         )
+        # Annotate each step with the active setpoint so the dashboard
+        # can draw the scheduled target alongside the predicted temp.
+        if setpoint_trace and traj:
+            for entry in traj:
+                idx = min(len(setpoint_trace) - 1, int(entry["t"]))
+                entry["setpoint"] = round(float(setpoint_trace[idx]), 2)
         self.prediction_history.append(
             {
                 "ts": timestamp,
@@ -552,6 +635,11 @@ class ThermalModel:
                 "t_indoor": t_indoor,
                 "t_outdoor": t_outdoor,
                 "solar_irradiance": solar_irradiance,
+                "setpoint_trace": (
+                    [round(float(x), 2) for x in setpoint_trace]
+                    if setpoint_trace
+                    else None
+                ),
                 "trajectory": traj,
             }
         )
