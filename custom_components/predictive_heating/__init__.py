@@ -51,18 +51,28 @@ from .frontend_panel import async_register_frontend
 from .thermal_model import ThermalModel
 from .zone import ZoneManager
 
+_LOGGER = logging.getLogger(__name__)
+
 # Pre-import platform modules so HA doesn't trip the "blocking call to
 # import_module inside the event loop" detector the first time a new
-# platform (number / switch / button) is forwarded. Since this __init__
-# itself is imported synchronously during integration load, these
-# imports all happen before any async entry-setup runs.
-from . import button as _pre_button  # noqa: F401
-from . import climate as _pre_climate  # noqa: F401
-from . import number as _pre_number  # noqa: F401
-from . import sensor as _pre_sensor  # noqa: F401
-from . import switch as _pre_switch  # noqa: F401
-
-_LOGGER = logging.getLogger(__name__)
+# platform (number / switch / button) is forwarded. We do this defensively
+# — a single broken platform module would otherwise prevent the whole
+# package from importing, which manifests as the infamously cryptic
+# "Config-flow kon niet geladen worden: Invalid handler specified" in
+# the HA UI (because HA couldn't even register our config_flow handler).
+# With the try/except in place, a broken platform logs a WARNING but
+# leaves the ConfigFlow reachable, so the user can at least re-configure
+# or remove the integration via the UI.
+for _mod_name in ("button", "climate", "number", "sensor", "switch"):
+    try:
+        __import__(f"{__name__}.{_mod_name}")
+    except Exception as _err:  # noqa: BLE001 — we really do want to swallow all
+        _LOGGER.warning(
+            "predictive_heating: pre-import of %s failed: %s "
+            "(config flow remains available; entry setup for this platform "
+            "may still fail until the error is fixed)",
+            _mod_name, _err,
+        )
 
 PLATFORMS_LIST = [
     Platform.CLIMATE,
@@ -99,6 +109,29 @@ def _store_for_entry(hass: HomeAssistant, entry_id: str) -> Store:
         private=True,
         atomic_writes=True,
     )
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> bool:
+    """No-op migrator.
+
+    We bumped ``ConfigFlow.VERSION`` to 2 when the options schema grew,
+    but every newly-added field is optional and defaulted, so entries
+    from VERSION=1 load fine without any data changes. HA still requires
+    a migrate function or it will refuse to load the old entry and log
+    "Migration handler not found" (which the user sees as a setup
+    failure and "Invalid handler specified" downstream if the entry is
+    locked into a broken state).
+    """
+    current = entry.version
+    if current < 2:
+        hass.config_entries.async_update_entry(entry, version=2)
+        _LOGGER.info(
+            "Migrated predictive_heating entry %s from version %d to 2",
+            entry.entry_id, current,
+        )
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
