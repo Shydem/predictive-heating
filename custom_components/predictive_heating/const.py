@@ -14,16 +14,35 @@ CONF_HEATING_ZONE = "heating_zone"
 CONF_MAX_SETPOINT_DELTA = "max_setpoint_delta"
 
 # Multi-room thermal coupling:
-# list of ``{neighbour_entry_id: str, u_value: float, enabled: bool}``
-# describing heat exchange between this room and another predictive-heating
-# room. The coupling term is ``U*(T_neighbour - T_room)``, added to the
-# standard loss equation. The optimizer/EKF only fits coupling for pairs
-# that are marked enabled. Defaults to an empty list — rooms are isolated
-# unless explicitly coupled.
+# list of per-neighbour dicts describing heat exchange between this room
+# and another predictive-heating room. The coupling term is
+# ``U*(T_neighbour - T_room)`` added to the standard loss equation.
+#
+# Supported fields per row:
+#   neighbour_entry_id : str  — the other Predictive Heating entry
+#   enabled            : bool — if False, the row is skipped entirely
+#   u_closed           : float — W/K when the linking door is closed (prior)
+#   u_open             : float — W/K when the linking door is open   (prior)
+#   door_sensor        : str | None — binary_sensor.*, state "on" means door open
+#   learn              : bool — if True, u_closed/u_open are updated online
+#                               from observed temperature divergence
+#   u_value            : float — legacy flat value (used when u_closed/u_open
+#                                absent, for back-compat with v0.6 options)
 CONF_THERMAL_COUPLINGS = "thermal_couplings"
 # Default U-value (W/K) for an internal partition with a closed door —
-# glazed interior doors ≈ 20–40 W/K, solid doors ≈ 10–15 W/K.
+# solid doors ≈ 10–15 W/K, glazed interior doors ≈ 20–40 W/K.
 DEFAULT_COUPLING_U = 20.0
+DEFAULT_COUPLING_U_CLOSED = 15.0
+# Open-door conductance jumps ~5–10× depending on area; 100 W/K is a
+# reasonable prior for a standard 2 m² internal doorway.
+DEFAULT_COUPLING_U_OPEN = 100.0
+# Online learning rate for U-value updates (gradient step per observation).
+# Small so a single noisy tick can't shove the estimate far.
+COUPLING_LEARN_RATE = 0.02
+# Bounds on learned U-values (W/K). Below 1 the partition might as well
+# be absent; above 400 we're effectively in one thermal space.
+COUPLING_U_MIN = 1.0
+COUPLING_U_MAX = 400.0
 
 # Gas / heat-source modelling (v0.3)
 CONF_GAS_METER_SENSOR = "gas_meter_sensor"
@@ -149,25 +168,57 @@ CONF_AWAY_GRACE_MIN = "away_grace_min"
 # pre-heat window; "gradual" linearly ramps it over the window so the
 # room warms smoothly and the MPC has a rising setpoint to track.
 CONF_COMFORT_RAMP = "comfort_ramp"
-# Master switch for the MPC. When disabled we fall back to the v0.1
-# hysteresis controller.
+# ── Deprecated MPC keys (v0.7) ──────────────────────────────────────
+# MPC was removed in v0.7 — the integration is now monitor-first and
+# uses the optimal-start PreheatPlanner to reach scheduled targets on
+# time by starting to heat earlier, rather than modulating the setpoint
+# with a receding-horizon optimiser. The keys are kept defined here so
+# existing config entries that still contain them don't KeyError on load
+# or options migration; no runtime code reads them any more.
 CONF_MPC_ENABLED = "mpc_enabled"
-# MPC horizon and granularity. Longer horizon = more anticipation but
-# the search space grows quadratically with N.
 CONF_MPC_HORIZON_MIN = "mpc_horizon_min"
 CONF_MPC_STEP_MIN = "mpc_step_min"
-# Transport delay on the boiler / radiator circuit. This is the
-# single most important MPC parameter for overshoot prevention —
-# increase it if you still see overshoot despite MPC being active.
 CONF_MPC_CONTROL_DELAY_MIN = "mpc_control_delay_min"
 
 DEFAULT_COMFORT_RAMP = "gradual"  # or "instant"
 DEFAULT_AWAY_GRACE_MIN = 10
-DEFAULT_MPC_ENABLED = True
+# Legacy defaults kept so any lingering reference resolves; see the
+# deprecation note above.
+DEFAULT_MPC_ENABLED = False
 DEFAULT_MPC_HORIZON_MIN = 60
 DEFAULT_MPC_STEP_MIN = 5
 DEFAULT_MPC_CONTROL_DELAY_MIN = 5
 COMFORT_RAMP_OPTIONS = ("gradual", "instant")
+
+# Control mode — controls how much this integration influences the
+# underlying thermostat. The intended primary role of the integration is
+# *monitoring and prediction*; any setpoint writing is opt-in.
+#
+#   "observe"  — never write to the thermostat. Only track, predict and
+#                display. The user controls the thermostat manually.
+#   "follow"   — write the schedule's preset °C to the thermostat on
+#                schedule transitions, and (if there's a known next
+#                transition to a warmer preset) start pre-heating early
+#                using the learned thermal model so the room reaches
+#                target on time. This is the default.
+#
+# NOTE on MPC: earlier versions shipped an "mpc" mode that actively
+# modulated the setpoint inside a preset. That has been removed in
+# v0.7 — the user found it too intrusive for a monitor-first
+# integration. Optimal-start pre-heat (via the PreheatPlanner) covers
+# the "reach target on time" case without MPC.
+CONF_CONTROL_MODE = "control_mode"
+CONTROL_MODE_OBSERVE = "observe"
+CONTROL_MODE_FOLLOW = "follow"
+CONTROL_MODE_OPTIONS = (CONTROL_MODE_OBSERVE, CONTROL_MODE_FOLLOW)
+DEFAULT_CONTROL_MODE = CONTROL_MODE_FOLLOW
+
+# Cap on how much the pre-heat planner can raise the written setpoint
+# above the preset's configured temperature in "follow" mode. The
+# primary tool for reaching target on time is *starting earlier*, not
+# pushing a higher temperature, so this is kept small.
+CONF_MAX_PREHEAT_NUDGE = "max_preheat_nudge"
+DEFAULT_MAX_PREHEAT_NUDGE = 0.5  # °C
 
 # Gas / heat source
 # Dutch Groningen-gas upper calorific value in MJ/m³ (typical billed value).

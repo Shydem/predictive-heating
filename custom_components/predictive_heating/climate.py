@@ -48,13 +48,11 @@ from .const import (
     CONF_BOILER_EFFICIENCY,
     CONF_CLIMATE_ENTITY,
     CONF_COMFORT_RAMP,
+    CONF_CONTROL_MODE,
     CONF_GAS_CALORIFIC_VALUE,
     CONF_GAS_METER_SENSOR,
     CONF_HEAT_SHARE,
-    CONF_MPC_CONTROL_DELAY_MIN,
-    CONF_MPC_ENABLED,
-    CONF_MPC_HORIZON_MIN,
-    CONF_MPC_STEP_MIN,
+    CONF_MAX_PREHEAT_NUDGE,
     CONF_OCCUPANCY_ENTITY,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
     CONF_OVERRIDE_ENTITY,
@@ -69,19 +67,20 @@ from .const import (
     CONF_THERMAL_COUPLINGS,
     CONF_WEATHER_ENTITY,
     CONF_WINDOW_SENSORS,
+    CONTROL_MODE_FOLLOW,
+    CONTROL_MODE_OBSERVE,
+    CONTROL_MODE_OPTIONS,
     DEFAULT_AWAY_GRACE_MIN,
     DEFAULT_AWAY_TEMP,
     DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_COMFORT_RAMP,
     DEFAULT_COMFORT_TEMP,
+    DEFAULT_CONTROL_MODE,
     DEFAULT_ECO_TEMP,
     DEFAULT_GAS_CALORIFIC_VALUE,
     DEFAULT_HEAT_SHARE,
     DEFAULT_IDLE_MIN_TEMP,
-    DEFAULT_MPC_CONTROL_DELAY_MIN,
-    DEFAULT_MPC_ENABLED,
-    DEFAULT_MPC_HORIZON_MIN,
-    DEFAULT_MPC_STEP_MIN,
+    DEFAULT_MAX_PREHEAT_NUDGE,
     DEFAULT_SCHEDULE_OFF_PRESET,
     DEFAULT_SCHEDULE_ON_PRESET,
     DEFAULT_WINDOW_OPEN_TEMP,
@@ -91,7 +90,6 @@ from .const import (
 )
 from .controller import HeatingAction, HeatingController, PresetMode
 from .heat_source import GasHeatSource
-from .mpc import MPCConfig
 from .preheat import PreheatConfig, PreheatPlan, PreheatPlanner
 from .presence import PresenceConfig, PresenceMonitor
 from .solar import estimate_solar_irradiance, get_solar_calculation
@@ -185,19 +183,28 @@ class PredictiveHeatingClimate(ClimateEntity):
         # fails to register.
         options = entry.options
 
-        # ── v0.3: MPC, pre-heat, presence ─────────────────────────
-        mpc_enabled = bool(options.get(CONF_MPC_ENABLED, DEFAULT_MPC_ENABLED))
-        mpc_config = MPCConfig(
-            horizon_min=_to_float(
-                options.get(CONF_MPC_HORIZON_MIN), DEFAULT_MPC_HORIZON_MIN
-            ),
-            step_min=_to_float(
-                options.get(CONF_MPC_STEP_MIN), DEFAULT_MPC_STEP_MIN
-            ),
-            control_delay_min=_to_float(
-                options.get(CONF_MPC_CONTROL_DELAY_MIN),
-                DEFAULT_MPC_CONTROL_DELAY_MIN,
-            ),
+        # ── v0.7: control_mode + pre-heat ─────────────────────────
+        # control_mode governs whether we write to the thermostat at
+        # all. In "observe" we never write; in "follow" we push the
+        # preset °C to the thermostat on schedule transitions and let
+        # the pre-heat planner decide when to start heating early so
+        # the room reaches the next target on time.
+        #
+        # MPC was removed in v0.7 — the pre-heat planner covers the
+        # "reach target on time" use case using the learned thermal
+        # model, without the aggressive in-preset modulation MPC did.
+        control_mode = str(
+            options.get(CONF_CONTROL_MODE, DEFAULT_CONTROL_MODE)
+        ).lower()
+        if control_mode not in CONTROL_MODE_OPTIONS:
+            _LOGGER.warning(
+                "Unknown control_mode %r — falling back to %r",
+                control_mode, DEFAULT_CONTROL_MODE,
+            )
+            control_mode = DEFAULT_CONTROL_MODE
+        self._control_mode = control_mode
+        self._max_preheat_nudge = _to_float(
+            options.get(CONF_MAX_PREHEAT_NUDGE), DEFAULT_MAX_PREHEAT_NUDGE
         )
         # Preset number entities share a dict with us via
         # hass.data[DOMAIN][entry_id]["preset_temps"]. We pass it in to
@@ -205,10 +212,12 @@ class PredictiveHeatingClimate(ClimateEntity):
         data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
         self._preset_temps = data.setdefault("preset_temps", {})
         self._room_data = data
+        # MPC removed in v0.7 — controller runs in plain hysteresis
+        # mode; pre-heat lead is provided by the PreheatPlanner below.
         self._controller = HeatingController(
             model,
-            mpc_enabled=mpc_enabled,
-            mpc_config=mpc_config,
+            mpc_enabled=False,
+            mpc_config=None,
             preset_temps_source=self._preset_temps,
         )
         # Register callbacks so the preset-number / override / simulate
@@ -365,22 +374,45 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._override_on = False
 
         # Multi-room coupling spec (list of dicts from the config entry).
+        # Config rows may come from either the legacy v0.6 shape
+        # ``{u_value, enabled}`` or the new v0.7 shape with separate
+        # closed/open U-values plus a door sensor. We normalise to the
+        # new shape here so the rest of the code only deals with one.
         coupling_cfg = (
             options.get(CONF_THERMAL_COUPLINGS)
             or config.get(CONF_THERMAL_COUPLINGS)
             or []
         )
         if coupling_cfg and not model.couplings:
-            from .const import DEFAULT_COUPLING_U
-            model.couplings = [
-                CouplingSpec(
-                    neighbour_entry_id=c["neighbour_entry_id"],
-                    u_value=_to_float(c.get("u_value"), DEFAULT_COUPLING_U),
-                    enabled=bool(c.get("enabled", True)),
+            from .const import (
+                DEFAULT_COUPLING_U,
+                DEFAULT_COUPLING_U_CLOSED,
+                DEFAULT_COUPLING_U_OPEN,
+            )
+            specs: list[CouplingSpec] = []
+            for c in coupling_cfg:
+                if not isinstance(c, dict) or not c.get("neighbour_entry_id"):
+                    continue
+                # Back-compat: old rows only have "u_value". Promote
+                # that to u_closed; start u_open from prior default.
+                u_closed = _to_float(
+                    c.get("u_closed", c.get("u_value")),
+                    DEFAULT_COUPLING_U_CLOSED,
                 )
-                for c in coupling_cfg
-                if isinstance(c, dict) and c.get("neighbour_entry_id")
-            ]
+                u_open = _to_float(
+                    c.get("u_open"), DEFAULT_COUPLING_U_OPEN
+                )
+                specs.append(
+                    CouplingSpec(
+                        neighbour_entry_id=c["neighbour_entry_id"],
+                        u_value=u_closed,  # closed stored under legacy name
+                        u_open=u_open,
+                        door_sensor=(c.get("door_sensor") or None),
+                        enabled=bool(c.get("enabled", True)),
+                        learn=bool(c.get("learn", True)),
+                    )
+                )
+            model.couplings = specs
 
         # Entity attributes
         self._attr_unique_id = f"predictive_heating_{entry.entry_id}"
@@ -957,7 +989,7 @@ class PredictiveHeatingClimate(ClimateEntity):
 
         The simulator and the 8h prediction snapshots both need to know
         "what temperature was the controller aiming for at each step"
-        — otherwise the MPC / 24h sim will anchor to the *current*
+        — otherwise the prediction / 24h sim will anchor to the *current*
         target and draw a flat line through scheduled transitions,
         which is the bug Sietse reported as "schedule is not
         incorporated correctly".
@@ -1356,7 +1388,37 @@ class PredictiveHeatingClimate(ClimateEntity):
                 nb_temp = float(nb_temp_raw)
             except (TypeError, ValueError):
                 continue
-            total_w += spec.u_value * (nb_temp - self._current_temp)
+
+            # Door-aware U: if the coupling has a door sensor, use the
+            # open U-value when the sensor reports "on", otherwise the
+            # closed U-value. Unknown / missing door state → closed
+            # (conservative; avoids attributing cross-talk to a
+            # coupling we're not sure is "live").
+            door_open: bool | None = None
+            if spec.door_sensor:
+                ds = self.hass.states.get(spec.door_sensor)
+                if ds is not None:
+                    door_open = ds.state == "on"
+            u = spec.active_u(door_open)
+            total_w += u * (nb_temp - self._current_temp)
+
+            # Online learner: nudge the currently-active U-value in the
+            # direction that reduces prediction error for this coupling.
+            # We can only do this meaningfully when we have at least
+            # two consecutive temperature samples for both rooms — the
+            # thermal model's EKF already has that machinery; here we
+            # pass the door state and observed neighbour temperature
+            # via stash slots so the model's per-step update can use
+            # them. Keeping the actual gradient step in thermal_model
+            # (where the full dT / dt context lives) avoids duplicating
+            # numerical bookkeeping on both sides.
+            if spec.learn:
+                # Stash per-coupling observation hints on the spec so
+                # ThermalModel.step() / EKF updates can consume them.
+                # Using attribute assignment avoids growing the dataclass
+                # for what is really a transient per-tick value.
+                spec._last_neighbour_temp = nb_temp  # type: ignore[attr-defined]
+                spec._last_door_open = door_open     # type: ignore[attr-defined]
         return total_w
 
     def _run_control_loop(self) -> None:
@@ -1405,32 +1467,38 @@ class PredictiveHeatingClimate(ClimateEntity):
         # intentionally DO NOT send a command in that case, so the
         # thermostat's OpenTherm modulation is left alone to work.
         #
-        # Key design note: even when no room *actively* wants heat, we
-        # leave the thermostat parked at the highest room-target (via
-        # HeatingZone.calculate_setpoint — which now returns the max
-        # target across rooms instead of None) so the thermostat can
-        # modulate down naturally instead of slamming to 5°C every time
-        # we hit the hysteresis top. That 5°C behaviour is reserved for
-        # the ventilation case (a window is open).
+        # NOTE on the previous bug (fixed v0.7): the caller used to
+        # double-check ``abs(self._zone._last_setpoint - setpoint) > 0.05``
+        # after calling ``calculate_setpoint()``. But ``calculate_setpoint``
+        # already updates ``_last_setpoint`` via ``_commit_setpoint`` before
+        # returning, so the double-check always saw last == setpoint and
+        # the service call was silently skipped. Result: the thermostat
+        # never got the new target after the first boot. We now trust the
+        # zone's return value verbatim — a non-None return means "push me".
+        #
+        # In ``observe`` control mode we skip the service call entirely;
+        # the zone's _last_setpoint is still updated so the dashboard /
+        # diagnostics continue to reflect what we *would* have sent.
         if self._window_open:
             # Ventilation: force a low setpoint so the boiler does not
-            # waste gas heating an open window.
+            # waste gas heating an open window. ``window_open_setpoint``
+            # is pure — it does not touch ``_last_setpoint`` — so the
+            # caller is responsible for the "did it change?" guard here.
             window_sp = self._zone.window_open_setpoint()
             last = self._zone._last_setpoint
             if last is None or abs(last - window_sp) > 0.1:
-                self.hass.async_create_task(
-                    self._async_set_underlying_temp(window_sp)
-                )
+                if self._control_mode != CONTROL_MODE_OBSERVE:
+                    self.hass.async_create_task(
+                        self._async_set_underlying_temp(window_sp)
+                    )
                 self._zone._last_setpoint = window_sp
         else:
             setpoint = self._zone.calculate_setpoint()
             if setpoint is not None:
-                last = self._zone._last_setpoint
-                if last is None or abs(last - setpoint) > 0.05:
+                if self._control_mode != CONTROL_MODE_OBSERVE:
                     self.hass.async_create_task(
                         self._async_set_underlying_temp(setpoint)
                     )
-                    self._zone._last_setpoint = setpoint
 
         # Update our HVAC action based on what the zone is actually doing
         self._update_hvac_action_from_zone()
@@ -1544,21 +1612,11 @@ class PredictiveHeatingClimate(ClimateEntity):
         if self._last_preheat_plan is not None:
             attrs["preheat"] = self._last_preheat_plan.as_diagnostic()
 
-        # v0.3: MPC diagnostics
-        attrs["control_mode"] = self._controller.state.mode_used
-        mpc_result = self._controller.state.last_mpc_result
-        if mpc_result is not None:
-            attrs["mpc"] = {
-                "action": mpc_result.action,
-                "reason": mpc_result.reason,
-                "cost": round(mpc_result.cost, 4),
-                "switch_at_step": mpc_result.switch_at_step,
-                "hysteresis_would_do": mpc_result.hysteresis_action,
-                # Only expose a short trajectory preview so attrs stay small.
-                "trajectory_preview": [
-                    round(t, 2) for t in mpc_result.predicted_trajectory[:6]
-                ],
-            }
+        # v0.7: control diagnostics — controller's internal mode_used
+        # is still exposed for debugging (e.g. "hysteresis",
+        # "window_open") alongside the user-selected write policy.
+        attrs["control_mode"] = self._control_mode
+        attrs["controller_mode"] = self._controller.state.mode_used
 
         # v0.3: presence diagnostics
         if self._presence.enabled:
@@ -1577,8 +1635,17 @@ class PredictiveHeatingClimate(ClimateEntity):
             attrs["thermal_couplings"] = [
                 {
                     "neighbour_entry_id": c.neighbour_entry_id,
-                    "u_value": c.u_value,
+                    "u_closed": round(c.u_value, 1),
+                    "u_open": round(c.u_open, 1),
+                    "door_sensor": c.door_sensor,
+                    "door_open": (
+                        self.hass.states.get(c.door_sensor).state == "on"
+                        if c.door_sensor
+                        and self.hass.states.get(c.door_sensor) is not None
+                        else None
+                    ),
                     "enabled": c.enabled,
+                    "learn": c.learn,
                 }
                 for c in self._model.couplings
             ]

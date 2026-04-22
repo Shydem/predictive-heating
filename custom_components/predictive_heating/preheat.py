@@ -348,7 +348,7 @@ class PreheatPlanner:
 
         # "gradual": linear ramp from low_target at start of pre-heat
         # to high_target at schedule_on, so the room warms smoothly
-        # and the MPC has a rising setpoint to track.
+        # and the controller has a rising setpoint to track.
         total = max(1.0, schedule_on_ts - preheat_start_ts)
         progress = (now_ts - preheat_start_ts) / total
         progress = max(0.0, min(1.0, progress))

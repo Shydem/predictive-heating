@@ -8,8 +8,8 @@ room reverts to the preset that was active before the switch-out.
 Design notes:
     * The monitor never *drives* target temperatures directly — it only
       emits ``"away"`` / ``"home"`` transition events and the climate
-      entity decides how to apply them. This keeps the MPC / preheat
-      logic from having to know about presence at all.
+      entity decides how to apply them. This keeps the pre-heat and
+      control logic from having to know about presence at all.
     * A short "leave grace period" prevents a single person.* glitch
       (GPS jitter, phone battery) from triggering a cold-down cycle.
       The default is 10 minutes.

@@ -60,10 +60,8 @@
           "person_entities": "Person entities (for Away auto-switching)",
           "away_grace_min": "Minutes before switching to Away when nobody home",
           "comfort_ramp": "Comfort ramp style",
-          "mpc_enabled": "Enable MPC (anti-overshoot)",
-          "mpc_horizon_min": "MPC planning horizon",
-          "mpc_step_min": "MPC timestep",
-          "mpc_control_delay_min": "Boiler/radiator transport delay"
+          "control_mode": "Control mode",
+          "max_preheat_nudge": "Max pre-heat nudge above target"
         },
         "data_description": {
           "room_name": "Renaming a room keeps all learned thermal properties — only the displayed name changes.",
@@ -82,10 +80,8 @@
           "person_entities": "When every listed person is away past the grace period the room switches to Away. When anyone returns the previous preset is restored automatically.",
           "away_grace_min": "Prevents a momentary GPS/phone glitch from cooling the room down. Default 10 min.",
           "comfort_ramp": "gradual: target temp ramps linearly from low to high over the pre-heat window. instant: jumps to the high target at the start of the window.",
-          "mpc_enabled": "When enabled, a short-horizon MPC plans ahead using the thermal model to minimise overshoot. Falls back to hysteresis until the model has calibrated.",
-          "mpc_horizon_min": "How far ahead the MPC plans. Longer = better overshoot prevention, more computation.",
-          "mpc_step_min": "Time between planning steps. 5 min is a good balance.",
-          "mpc_control_delay_min": "Minutes of transport delay the MPC assumes between the setpoint command and heat actually stopping. Increase if you still see overshoot."
+          "control_mode": "observe: never writes to the thermostat — the integration only monitors and predicts. follow: writes the scheduled preset temperature to the thermostat, plus a small pre-heat nudge when needed so the room reaches the target on time.",
+          "max_preheat_nudge": "Upper bound on how far above the scheduled target the pre-heat planner is allowed to push the setpoint while ramping in. Keep small (≤0.5 °C) so the heat pump stays in its efficient modulating range. Set to 0 to disable pre-heat nudges."
         }
       }
     }

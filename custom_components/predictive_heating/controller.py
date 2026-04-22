@@ -2,19 +2,14 @@
 Heating controller — decides when and how much to heat.
 
 v0.1: Simple hysteresis on/off with window detection.
-v0.3: Optional MPC mode for anticipation + overshoot prevention.
+v0.7: MPC removed — the integration is now monitor-first and uses a
+    separate optimal-start ``PreheatPlanner`` (see preheat.py) to
+    decide when to start heating early so a scheduled target is
+    reached on time.
 
-Control modes:
-    * ``HYSTERESIS`` — plain ±band on/off. Always safe, works before
-      the thermal model is calibrated.
-    * ``MPC``        — short-horizon receding-horizon optimiser that
-      plans ``N`` timesteps ahead using the learned thermal model and
-      picks the control action that minimises predicted overshoot.
-      Automatically falls back to hysteresis if the model hasn't
-      calibrated yet or if the MPC solve fails.
-
-The controller still exposes the same single ``update()`` entry point,
-so the climate entity doesn't need to care which mode is active.
+The controller exposes a single ``update()`` entry point, currently
+running plain hysteresis. The ``mpc_enabled`` / ``mpc_config`` kwargs
+are accepted for signature back-compat but ignored.
 """
 
 from __future__ import annotations
@@ -24,7 +19,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from .const import DEFAULT_HYSTERESIS, STATE_CALIBRATED
-from .mpc import MPCConfig, MPCController, MPCResult
 from .thermal_model import ThermalModel
 
 _LOGGER = logging.getLogger(__name__)
@@ -59,10 +53,11 @@ class ControllerState:
     preset: PresetMode = PresetMode.COMFORT
     window_open: bool = False
     is_heating: bool = False
-    # Populated by the MPC on each solve — None when running in plain
-    # hysteresis mode. Useful as a diagnostic in the UI.
-    last_mpc_result: MPCResult | None = None
-    # "hysteresis" or "mpc" — which mode produced the last decision.
+    # v0.7: MPC removed. Left as ``None`` for back-compat with any
+    # external code that still reads the attribute; no longer populated.
+    last_mpc_result: object | None = None
+    # "hysteresis" or "window_open" — which branch produced the last
+    # decision. Used for diagnostics in the UI.
     mode_used: str = "hysteresis"
 
 
@@ -74,13 +69,13 @@ class HeatingController:
         Heat ON  when temp < target - hysteresis
         Heat OFF when temp > target + hysteresis
 
-    v0.3 — MPC mode (optional):
-        When ``mpc_enabled`` and the thermal model is calibrated, the
-        MPC plans ``horizon_min`` ahead and picks the action that
-        minimises predicted overshoot. Falls back to hysteresis if the
-        model isn't calibrated yet.
+    v0.7 — MPC removed:
+        The controller runs in plain hysteresis. Pre-heat anticipation
+        is provided by the separate :class:`PreheatPlanner` which
+        raises the *target* earlier; the controller itself is intentionally
+        simple so it never fights the thermostat's own modulation.
 
-    Window open → always OFF, in both modes.
+    Window open → always OFF.
     """
 
     def __init__(
@@ -88,15 +83,18 @@ class HeatingController:
         thermal_model: ThermalModel,
         hysteresis: float = DEFAULT_HYSTERESIS,
         *,
-        mpc_enabled: bool = False,
-        mpc_config: MPCConfig | None = None,
+        mpc_enabled: bool = False,  # kept for signature back-compat; ignored
+        mpc_config: object | None = None,  # ditto
         preset_temps_source: dict | None = None,
     ) -> None:
         self.model = thermal_model
         self.hysteresis = hysteresis
         self.state = ControllerState()
-        self.mpc_enabled = mpc_enabled
-        self._mpc = MPCController(thermal_model, mpc_config) if mpc_enabled else None
+        # v0.7: MPC removed. These attributes are retained so external
+        # code probing for them doesn't crash, but they're always
+        # False / None and the update() path never uses them.
+        self.mpc_enabled = False
+        self._mpc = None
 
         # ``preset_temps_source`` is a shared dict owned by the integration
         # (populated by the preset number entities). The controller always
@@ -129,18 +127,16 @@ class HeatingController:
         except (TypeError, ValueError):
             return fallback
 
-    def set_mpc_enabled(self, enabled: bool, config: MPCConfig | None = None) -> None:
-        """Toggle MPC at runtime (called from the options flow)."""
-        self.mpc_enabled = enabled
-        if enabled:
-            self._mpc = MPCController(self.model, config)
-        else:
-            self._mpc = None
+    def set_mpc_enabled(self, enabled: bool, config: object | None = None) -> None:
+        """No-op since v0.7 — MPC was removed. Kept for API stability."""
+        # Accepting the call without effect means options-flow handlers
+        # that still forward the old toggle keep working during upgrades.
+        self.mpc_enabled = False
+        self._mpc = None
 
-    def update_mpc_config(self, config: MPCConfig) -> None:
-        """Replace the active MPC config (horizon / delay tuning)."""
-        if self._mpc is not None:
-            self._mpc = MPCController(self.model, config)
+    def update_mpc_config(self, config: object) -> None:
+        """No-op since v0.7 — MPC was removed."""
+        return
 
     def set_preset(self, preset: PresetMode) -> None:
         """Change the active preset mode."""
@@ -183,10 +179,8 @@ class HeatingController:
         Evaluate current conditions and return the desired heating action.
 
         Order of decisions:
-            1. Window open          → OFF
-            2. MPC enabled + model  → MPC solves ahead and decides
-               calibrated
-            3. Otherwise            → hysteresis
+            1. Window open   → OFF
+            2. Otherwise     → hysteresis on target
         """
         target = self.state.target_temp
 
@@ -198,36 +192,7 @@ class HeatingController:
             self.state.last_mpc_result = None
             return HeatingAction.OFF
 
-        # Rule 2: MPC (if enabled + model calibrated)
-        if (
-            self.mpc_enabled
-            and self._mpc is not None
-            and self.model.state == STATE_CALIBRATED
-        ):
-            try:
-                result = self._mpc.solve(
-                    t_indoor=t_indoor,
-                    t_outdoor=t_outdoor,
-                    t_target=target,
-                    solar_irradiance=solar_irradiance,
-                    currently_heating=self.state.is_heating,
-                )
-                self.state.last_mpc_result = result
-                self.state.mode_used = "mpc"
-
-                heat_now = result.action == "heat"
-                self._mpc.record_command(heat_now)
-                self.state.is_heating = heat_now
-                self.state.action = (
-                    HeatingAction.HEAT if heat_now else HeatingAction.OFF
-                )
-                return self.state.action
-            except Exception as err:  # noqa: BLE001 — fall back to hysteresis
-                _LOGGER.warning(
-                    "MPC solve failed (%s) — falling back to hysteresis", err
-                )
-
-        # Rule 3: Hysteresis fallback
+        # Rule 2: Hysteresis
         self.state.mode_used = "hysteresis"
         self.state.last_mpc_result = None
         if t_indoor < target - self.hysteresis:

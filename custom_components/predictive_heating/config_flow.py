@@ -26,12 +26,10 @@ from .const import (
     CONF_GAS_CALORIFIC_VALUE,
     CONF_GAS_METER_SENSOR,
     CONF_HEAT_SHARE,
+    CONF_CONTROL_MODE,
     CONF_HUMIDITY_SENSOR,
+    CONF_MAX_PREHEAT_NUDGE,
     CONF_MAX_SETPOINT_DELTA,
-    CONF_MPC_CONTROL_DELAY_MIN,
-    CONF_MPC_ENABLED,
-    CONF_MPC_HORIZON_MIN,
-    CONF_MPC_STEP_MIN,
     CONF_NUDGE_INTERVAL_MIN,
     CONF_NUDGE_STEP,
     CONF_OUTDOOR_TEMPERATURE_SENSOR,
@@ -44,22 +42,23 @@ from .const import (
     CONF_THERMAL_COUPLINGS,
     CONF_WEATHER_ENTITY,
     CONF_WINDOW_SENSORS,
-    DEFAULT_COUPLING_U,
+    CONTROL_MODE_OPTIONS,
     DEFAULT_AWAY_GRACE_MIN,
+    DEFAULT_AWAY_TEMP,
     DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_BUILDING_TYPE,
     DEFAULT_CEILING_HEIGHT_M,
     DEFAULT_COMFORT_RAMP,
     DEFAULT_COMFORT_TEMP,
+    DEFAULT_CONTROL_MODE,
+    DEFAULT_COUPLING_U,
+    DEFAULT_COUPLING_U_CLOSED,
+    DEFAULT_COUPLING_U_OPEN,
     DEFAULT_ECO_TEMP,
-    DEFAULT_AWAY_TEMP,
     DEFAULT_GAS_CALORIFIC_VALUE,
     DEFAULT_HEAT_SHARE,
+    DEFAULT_MAX_PREHEAT_NUDGE,
     DEFAULT_MAX_SETPOINT_DELTA,
-    DEFAULT_MPC_CONTROL_DELAY_MIN,
-    DEFAULT_MPC_ENABLED,
-    DEFAULT_MPC_HORIZON_MIN,
-    DEFAULT_MPC_STEP_MIN,
     DEFAULT_NUDGE_INTERVAL_MIN,
     DEFAULT_NUDGE_STEP,
     DEFAULT_SLEEP_TEMP,
@@ -75,6 +74,11 @@ _BUILDING_TYPE_OPTIONS = [
 _COMFORT_RAMP_OPTIONS = [
     selector.SelectOptionDict(value=v, label=v.title())
     for v in COMFORT_RAMP_OPTIONS
+]
+
+_CONTROL_MODE_OPTIONS = [
+    selector.SelectOptionDict(value=v, label=v.title())
+    for v in CONTROL_MODE_OPTIONS
 ]
 
 _LOGGER = logging.getLogger(__name__)
@@ -436,7 +440,7 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                     mode=selector.NumberSelectorMode.BOX,
                 )
             ),
-            # ── Predictive pre-heat + MPC (v0.3) ──────────────────
+            # ── Predictive pre-heat + monitoring (v0.7) ───────────
             vol.Optional(
                 CONF_WEATHER_ENTITY,
                 default=(
@@ -479,41 +483,36 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
             ),
+            # v0.7: MPC was removed. The integration is now monitor-first,
+            # with the controller just following the preset schedule and the
+            # PreheatPlanner raising the target a bit earlier so the thermostat
+            # reaches the scheduled temperature on time. The two knobs exposed
+            # to the user are:
+            #   * control_mode — "observe" (never writes a setpoint; purely a
+            #       predictive monitor) vs "follow" (writes the scheduled preset
+            #       plus at most max_preheat_nudge extra while pre-heating).
+            #   * max_preheat_nudge — upper bound on how far above the scheduled
+            #       target the pre-heat planner is allowed to push the setpoint
+            #       when it needs to reach the target on time. 0 disables.
             vol.Optional(
-                CONF_MPC_ENABLED,
-                default=options.get(CONF_MPC_ENABLED, DEFAULT_MPC_ENABLED),
-            ): selector.BooleanSelector(),
-            vol.Optional(
-                CONF_MPC_HORIZON_MIN,
-                default=options.get(CONF_MPC_HORIZON_MIN, DEFAULT_MPC_HORIZON_MIN),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=15, max=240, step=5,
-                    unit_of_measurement="min",
-                    mode=selector.NumberSelectorMode.BOX,
+                CONF_CONTROL_MODE,
+                default=options.get(CONF_CONTROL_MODE, DEFAULT_CONTROL_MODE),
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=_CONTROL_MODE_OPTIONS,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
                 )
             ),
             vol.Optional(
-                CONF_MPC_STEP_MIN,
-                default=options.get(CONF_MPC_STEP_MIN, DEFAULT_MPC_STEP_MIN),
-            ): selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=1, max=15, step=1,
-                    unit_of_measurement="min",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
-            ),
-            vol.Optional(
-                CONF_MPC_CONTROL_DELAY_MIN,
+                CONF_MAX_PREHEAT_NUDGE,
                 default=options.get(
-                    CONF_MPC_CONTROL_DELAY_MIN,
-                    DEFAULT_MPC_CONTROL_DELAY_MIN,
+                    CONF_MAX_PREHEAT_NUDGE, DEFAULT_MAX_PREHEAT_NUDGE
                 ),
             ): selector.NumberSelector(
                 selector.NumberSelectorConfig(
-                    min=0, max=30, step=1,
-                    unit_of_measurement="min",
-                    mode=selector.NumberSelectorMode.BOX,
+                    min=0.0, max=2.0, step=0.1,
+                    unit_of_measurement="°C",
+                    mode=selector.NumberSelectorMode.SLIDER,
                 )
             ),
         }
@@ -574,21 +573,26 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
     ) -> config_entries.ConfigFlowResult:
         """Edit thermal couplings to neighbouring rooms.
 
-        For every *other* predictive-heating config entry we render two
-        fields:
+        For every *other* predictive-heating config entry we render a small
+        group of fields:
 
-          * ``couple_<entry_id>_enabled`` — whether heat exchange with
-            this neighbour is modelled at all.
-          * ``couple_<entry_id>_u`` — the conductance in W/K (how "open"
-            the partition is — closed solid door ≈ 10 W/K, glazed door
-            ≈ 20–40, open doorway ≈ 60–120).
+          * ``couple_<entry_id>_enabled`` — whether heat exchange with this
+            neighbour is modelled at all.
+          * ``couple_<entry_id>_u_closed`` — conductance in W/K when the door
+            between the two rooms is closed (or always, if no door sensor).
+            Closed solid door ≈ 10–20 W/K, glazed door ≈ 20–40.
+          * ``couple_<entry_id>_u_open`` — conductance when the door is open.
+            Typical open doorway ≈ 60–150 W/K.
+          * ``couple_<entry_id>_door_sensor`` — optional binary_sensor used to
+            pick between u_closed and u_open live.
+          * ``couple_<entry_id>_learn`` — whether the online learner is
+            allowed to refine u_closed/u_open from observed thermal drift.
 
-        On submit we serialise to a list of
-        ``{"neighbour_entry_id", "enabled", "u_value"}`` dicts under
-        ``CONF_THERMAL_COUPLINGS`` in the entry's options. The rest of
-        the integration only consults enabled rows with u_value > 0, so
-        the user can keep defaults around without having them affect the
-        model.
+        On submit we serialise to a list of dicts under
+        ``CONF_THERMAL_COUPLINGS`` in the entry's options:
+        ``{neighbour_entry_id, enabled, u_closed, u_open, door_sensor, learn}``.
+        We also keep writing the legacy ``u_value`` key (= u_closed) so older
+        builds of the runtime loader stay compatible during rollout.
         """
         # Build the list of neighbour entries once per render so we know
         # which keys to read back when the user submits the form.
@@ -605,21 +609,45 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
             couplings: list[dict[str, Any]] = []
             for entry_id, _title in neighbours:
                 enabled = bool(user_input.get(f"couple_{entry_id}_enabled", False))
-                try:
-                    u_value = float(
-                        user_input.get(f"couple_{entry_id}_u", DEFAULT_COUPLING_U)
-                    )
-                except (TypeError, ValueError):
-                    u_value = DEFAULT_COUPLING_U
-                # Clamp — the schema already does this via selector bounds,
-                # but be defensive since options flow input is essentially
-                # user-controlled JSON.
-                u_value = max(0.0, min(500.0, u_value))
+
+                def _read_float(key: str, fallback: float) -> float:
+                    try:
+                        return float(user_input.get(key, fallback))
+                    except (TypeError, ValueError):
+                        return fallback
+
+                u_closed = _read_float(
+                    f"couple_{entry_id}_u_closed", DEFAULT_COUPLING_U_CLOSED
+                )
+                u_open = _read_float(
+                    f"couple_{entry_id}_u_open", DEFAULT_COUPLING_U_OPEN
+                )
+                # Clamp — schema enforces this but be defensive since the
+                # options flow input is essentially user-controlled JSON.
+                u_closed = max(0.0, min(500.0, u_closed))
+                u_open = max(0.0, min(500.0, u_open))
+                # Physically, an open door conducts more heat than a closed
+                # one. If the user (or a stale default) violates that, push
+                # u_open up to at least u_closed so the learner starts from
+                # a sane prior.
+                if u_open < u_closed:
+                    u_open = u_closed
+
+                door_sensor = user_input.get(f"couple_{entry_id}_door_sensor") or None
+                learn = bool(user_input.get(f"couple_{entry_id}_learn", True))
+
                 couplings.append(
                     {
                         "neighbour_entry_id": entry_id,
                         "enabled": enabled,
-                        "u_value": u_value,
+                        "u_closed": u_closed,
+                        "u_open": u_open,
+                        # Legacy key — older thermal_model builds read
+                        # ``u_value`` instead of ``u_closed``. Keep it in sync
+                        # so rollbacks and partial upgrades don't misread.
+                        "u_value": u_closed,
+                        "door_sensor": door_sensor,
+                        "learn": learn,
                     }
                 )
 
@@ -654,6 +682,23 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
         schema_dict: dict[Any, Any] = {}
         for entry_id, title in neighbours:
             saved = existing.get(entry_id, {})
+
+            # Resolve defaults with v0.6 back-compat: if only the old
+            # ``u_value`` field is present, use it as the u_closed default
+            # and fall back to DEFAULT_COUPLING_U_OPEN for u_open.
+            legacy_u = saved.get("u_value")
+            u_closed_default = float(
+                saved.get(
+                    "u_closed",
+                    legacy_u if legacy_u is not None else DEFAULT_COUPLING_U_CLOSED,
+                )
+            )
+            u_open_default = float(
+                saved.get("u_open", DEFAULT_COUPLING_U_OPEN)
+            )
+            door_sensor_default = saved.get("door_sensor") or vol.UNDEFINED
+            learn_default = bool(saved.get("learn", True))
+
             schema_dict[
                 vol.Optional(
                     f"couple_{entry_id}_enabled",
@@ -663,8 +708,8 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
             ] = selector.BooleanSelector()
             schema_dict[
                 vol.Optional(
-                    f"couple_{entry_id}_u",
-                    default=float(saved.get("u_value", DEFAULT_COUPLING_U)),
+                    f"couple_{entry_id}_u_closed",
+                    default=u_closed_default,
                 )
             ] = selector.NumberSelector(
                 selector.NumberSelectorConfig(
@@ -675,6 +720,34 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                     mode=selector.NumberSelectorMode.BOX,
                 )
             )
+            schema_dict[
+                vol.Optional(
+                    f"couple_{entry_id}_u_open",
+                    default=u_open_default,
+                )
+            ] = selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.0,
+                    max=400.0,
+                    step=1.0,
+                    unit_of_measurement="W/K",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            )
+            schema_dict[
+                vol.Optional(
+                    f"couple_{entry_id}_door_sensor",
+                    default=door_sensor_default,
+                )
+            ] = selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="binary_sensor")
+            )
+            schema_dict[
+                vol.Optional(
+                    f"couple_{entry_id}_learn",
+                    default=learn_default,
+                )
+            ] = selector.BooleanSelector()
             # A blank spacer — in HA's forms there's no header element,
             # so we rely on field order and the label prefix ("couple_"
             # + room name) to communicate grouping. Labels come from

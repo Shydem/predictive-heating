@@ -29,6 +29,9 @@ from dataclasses import dataclass, field
 
 from .const import (
     BUILDING_TYPES,
+    COUPLING_LEARN_RATE,
+    COUPLING_U_MAX,
+    COUPLING_U_MIN,
     DEFAULT_BUILDING_TYPE,
     DEFAULT_CEILING_HEIGHT_M,
     DEFAULT_COUPLING_U,
@@ -166,17 +169,60 @@ class ThermalObservation:
 
 @dataclass
 class CouplingSpec:
-    """Description of a thermal connection to another room."""
+    """Description of a thermal connection to another room.
+
+    Two U-values are tracked — one for when the linking door is closed
+    (solid partition conductance) and one for when it is open (open
+    doorway conductance, typically 5–10× larger). A ``door_sensor``
+    binary_sensor selects which U to apply at each tick. When no door
+    sensor is configured we always use ``u_closed``.
+
+    Both U-values can be *learned online* from observed data — when
+    ``learn`` is True the model's update loop nudges them toward the
+    value that best explains the sign/magnitude of observed cross-room
+    temperature divergence. This lets the user declare the connection
+    without having to know the exact conductance.
+    """
 
     # entry_id of the other predictive-heating room
     neighbour_entry_id: str
-    # Heat-exchange coefficient (W/K). Positive = heat flows from the
-    # warmer side to the colder side.
+    # Heat-exchange coefficient (W/K) when the door between the two
+    # rooms is *closed*. Kept under the legacy name ``u_value`` for
+    # back-compat with pickles from v0.6.
     u_value: float = DEFAULT_COUPLING_U
+    # Conductance when the door is reported open. Initialised to a
+    # "typical doorway" prior; auto-learned when ``learn`` is True.
+    u_open: float = 100.0
+    # Optional binary_sensor.* entity reporting door state
+    # ("on" == open).
+    door_sensor: str | None = None
     # If false, the coupling is *declared* but not included in the
-    # learning step — useful when you want to disable a particular
-    # connection (e.g. a door is closed) without removing it.
+    # model step — useful for keeping an edge in the config while
+    # temporarily ignoring it.
     enabled: bool = True
+    # Whether to let the online learner update u_value / u_open from
+    # observations. Defaults True so the user gets auto-calibration
+    # without extra clicks.
+    learn: bool = True
+
+    @property
+    def u_closed(self) -> float:
+        """Conductance with the door closed (alias for u_value)."""
+        return self.u_value
+
+    @u_closed.setter
+    def u_closed(self, value: float) -> None:
+        self.u_value = value
+
+    def active_u(self, door_is_open: bool | None) -> float:
+        """Return the U-value to use given the current door state.
+
+        ``door_is_open`` is ``None`` when the coupling has no linked
+        sensor or its state is unknown — we assume closed (the more
+        conservative choice: smaller conductance → less cross-talk
+        attributed to the coupling, so learning is slower but safer).
+        """
+        return self.u_open if door_is_open else self.u_value
 
 
 @dataclass
@@ -357,6 +403,14 @@ class ThermalModel:
             self.last_dT_observed = dT
             self.last_dT_predicted = dT - innovation
 
+            # ── Online coupling-U learner (v0.7) ─────────────────────
+            # Nudge each learnable coupling's U-value in the direction
+            # that would better explain the innovation (observed minus
+            # predicted dT). Per-spec, per-door-state — so u_closed and
+            # u_open converge independently depending on which door
+            # state dominated recent observations.
+            self._learn_couplings(prev, dt_hours, innovation)
+
             # Sync EKF estimates back to params
             ekf_state = self._ekf.state
             self.params.heat_loss_coeff = ekf_state.H
@@ -428,6 +482,80 @@ class ThermalModel:
                 )
                 if len(self.h_history) > 300:
                     self.h_history = self.h_history[-300:]
+
+    def _learn_couplings(
+        self,
+        prev: ThermalObservation,
+        dt_hours: float,
+        innovation: float,
+    ) -> None:
+        """Online gradient update for per-coupling U-values.
+
+        The integration's climate entity stashes
+        ``spec._last_neighbour_temp`` and ``spec._last_door_open`` on each
+        :class:`CouplingSpec` every time it computes the neighbour-coupling
+        heat flux. We use those stashed values together with the EKF
+        innovation (observed dT minus predicted dT) to drive a very small,
+        bounded gradient step per observation:
+
+            * If the neighbour is warmer than us (``dT_neigh > 0``) and the
+              room warmed *more* than predicted (``innovation > 0``), the
+              current U was too low → increase it.
+            * If the neighbour is warmer and we warmed *less* than
+              predicted, U was overstated → decrease it.
+            * Symmetric for a colder neighbour.
+
+        u_closed and u_open are learned *separately*, selected at each tick
+        by the stashed door-state, which is why the door sensor is the
+        single most useful per-coupling input the user can provide.
+
+        The learner is intentionally crude: the EKF can absorb unexplained
+        heat into H, so a large learn-rate would fight it. We keep the rate
+        small (``COUPLING_LEARN_RATE``) and clamp each per-step change to a
+        physically reasonable window, so the net effect is a slow drift
+        toward the value that minimally reduces residuals — good enough for
+        a monitor-first integration, and safe even when there are several
+        couplings that can "explain" the same anomaly.
+        """
+        if not self.couplings:
+            return
+        # Skip tiny sample intervals (too noisy) and outlier innovations
+        # that are probably spurious (window opened, heat-pump DHW spike,
+        # sensor glitch).
+        if dt_hours <= 0 or abs(innovation) > 1.5:
+            return
+
+        for spec in self.couplings:
+            if not getattr(spec, "enabled", True):
+                continue
+            if not getattr(spec, "learn", True):
+                continue
+            t_neigh = getattr(spec, "_last_neighbour_temp", None)
+            if t_neigh is None:
+                continue
+            door_open = bool(getattr(spec, "_last_door_open", False))
+            dT_neigh = float(t_neigh) - float(prev.t_indoor)
+            # Weak driving gradient — below ~0.1 °C the innovation is
+            # dominated by measurement noise, not by this coupling.
+            if abs(dT_neigh) < 0.1:
+                continue
+
+            # Gradient sign: same sign as innovation * sign(dT_neigh).
+            direction = 1.0 if dT_neigh > 0 else -1.0
+            # Scale by dt so long-interval observations aren't dwarfed by
+            # tight-cadence ones; cap the effective dt so a 90-min gap
+            # doesn't produce a giant step.
+            eff_dt = max(0.05, min(dt_hours, 0.5))
+            step = COUPLING_LEARN_RATE * innovation * direction * eff_dt
+            # Hard cap: never move a single U by more than 5 W/K per tick.
+            step = max(-5.0, min(5.0, step))
+
+            if door_open:
+                new_u = spec.u_open + step
+                spec.u_open = max(COUPLING_U_MIN, min(COUPLING_U_MAX, new_u))
+            else:
+                new_u = spec.u_value + step
+                spec.u_value = max(COUPLING_U_MIN, min(COUPLING_U_MAX, new_u))
 
     def _check_calibration(self) -> None:
         """Check if the model is calibrated."""
