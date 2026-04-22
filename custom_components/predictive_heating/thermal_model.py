@@ -56,45 +56,77 @@ def _proportional_heat_plan(
     solar_trace: list[float],
     params,
     hours: int,
-    band: float = 0.6,
+    band: float = 1.5,
+    sub_steps_per_hour: int = 4,
 ) -> list[float]:
     """Derive a per-hour 0..1 heating fraction that tracks ``setpoint_trace``.
 
-    This is a simple forward-sim proportional controller. We walk the
-    temperature forward hour by hour; at each step the heating
-    fraction is scaled linearly with the error (target - temp) over
-    the proportional band. This is what produces a realistic "the
-    boiler modulated around 50% for two hours as the setpoint held"
-    recorded forecast, instead of the old "no heat ever" behaviour
-    which drifted badly after any scheduled transition.
+    This is a proportional+feed-forward controller simulated at 15-min
+    sub-steps and then averaged into an hourly fraction. Two properties
+    make the output smooth enough to avoid the sawtooth / oscillation
+    Sietse reported:
+
+    * **Feed-forward steady-state fraction.** We first compute the
+      fraction the heater would need just to cancel the heat loss at
+      ``(target - t_outdoor)``. The proportional term adds or removes
+      heat around that baseline — so when the room is already at target
+      the plan sits at the correct steady-state fraction instead of
+      bouncing between 0 and 1.
+    * **Wider proportional band (1.5 °C).** The previous 0.6 °C band
+      caused the plan to saturate at 0 or 1 for tiny errors, which shows
+      up as square-wave heating in the simulation and made the room
+      temperature oscillate around the setpoint. 1.5 °C gives a soft
+      modulation window closer to how a real OpenTherm loop behaves.
+    * **Sub-hourly integration.** Recomputing the error every 15 min
+      (four sub-steps per hour) lets the plan react within the hour —
+      otherwise a setpoint transition at hour H only got a reaction at
+      hour H+1, which manifested as a visible overshoot.
+
+    The returned list has exactly one entry per hour (averaging the
+    sub-step fractions) so the caller's per-hour heat-fraction shape
+    and ``predict_trajectory``'s hourly sampling both stay backward
+    compatible.
     """
     p = params
     C_watt_h = p.thermal_mass * 1000 / 3600
+    heat_power = max(1.0, p.heating_power)
     if C_watt_h <= 0 or hours <= 0:
         return []
+
+    sub = max(1, int(sub_steps_per_hour))
+    dt_h = 1.0 / sub
 
     plan: list[float] = []
     t = t_indoor
     for h in range(max(1, hours)):
+        # Hourly trace samples — held constant across the hour's substeps.
         target = float(
             setpoint_trace[min(len(setpoint_trace) - 1, h)]
-        )
-        error = target - t
-        frac = max(0.0, min(1.0, 0.5 + error / band))
-        plan.append(frac)
-        # Step the temperature forward one hour at this fraction so the
-        # next iteration's error reflects the thermal response.
-        q_heat = frac * p.heating_power
-        q_solar = (
-            solar_trace[min(len(solar_trace) - 1, h)] * p.solar_gain_factor
-            if solar_trace else 0.0
         )
         t_out = (
             outdoor_trace[min(len(outdoor_trace) - 1, h)]
             if outdoor_trace else t
         )
-        q_loss = p.heat_loss_coeff * (t - t_out)
-        t += (q_heat + q_solar - q_loss) / C_watt_h  # 1 h step
+        solar_w = (
+            solar_trace[min(len(solar_trace) - 1, h)] * p.solar_gain_factor
+            if solar_trace else 0.0
+        )
+
+        frac_sum = 0.0
+        for _ in range(sub):
+            # Feed-forward: how much heat do we need to hold target given
+            # the current outdoor temperature and solar gain?
+            q_ff = p.heat_loss_coeff * (target - t_out) - solar_w
+            ff_frac = max(0.0, min(1.0, q_ff / heat_power))
+            # Proportional correction around that baseline.
+            error = target - t
+            frac = max(0.0, min(1.0, ff_frac + error / band))
+            frac_sum += frac
+            # Step the temperature forward one sub-step.
+            q_heat = frac * heat_power
+            q_loss = p.heat_loss_coeff * (t - t_out)
+            t += (q_heat + solar_w - q_loss) / C_watt_h * dt_h
+        plan.append(frac_sum / sub)
     return plan
 
 
@@ -441,10 +473,14 @@ class ThermalModel:
                 # No meter: use the EKF's learned P_heat.
                 self.params.heating_power = ekf_state.P_heat
 
-            # Track H evolution
+            # Track H evolution. Attach the observation timestamp so the
+            # dashboard can plot H(t) with a real time axis — the previous
+            # "Sample #" axis hid whether updates came in bursts or
+            # steadily, which Sietse flagged as unusable.
             self.h_history.append(
                 {
                     "sample": self.total_updates,
+                    "ts": curr.timestamp,
                     "value": ekf_state.H,
                 }
             )
@@ -456,6 +492,7 @@ class ThermalModel:
                 self.prediction_error_history.append(
                     {
                         "sample": self.total_updates,
+                        "ts": curr.timestamp,
                         "value": self._ekf.mean_prediction_error,
                     }
                 )
@@ -477,6 +514,7 @@ class ThermalModel:
                 self.h_history.append(
                     {
                         "sample": self._h_over_c_count,
+                        "ts": curr.timestamp,
                         "value": self.params.heat_loss_coeff,
                     }
                 )

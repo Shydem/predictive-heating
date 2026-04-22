@@ -14,6 +14,7 @@ the "can't open rooms" regression we're guarding against.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import voluptuous as vol
@@ -507,16 +508,32 @@ def _build_room_detail(
             }
         )
 
-    # H evolution history for the learning chart
+    # H evolution history for the learning chart — forwarded with both
+    # ``sample`` (legacy) and ``ts`` (preferred, for time-axis plots). The
+    # dashboard switched to a time axis in v0.7.1; older snapshots from
+    # disk may lack ``ts``, so we synthesise a fallback from the current
+    # time backwards by the update interval. This keeps pre-upgrade data
+    # usable while new samples land with real timestamps.
+    now_ts = time.time()
+    update_interval_s = 120.0  # controller tick; matches _async_periodic_update
     h_history = []
-    for entry in getattr(model, "h_history", []):
+    h_raw = list(getattr(model, "h_history", []))
+    missing_ts_count = sum(
+        1 for e in h_raw if isinstance(e, dict) and e.get("ts") is None
+    )
+    for idx, entry in enumerate(h_raw):
         if not isinstance(entry, dict):
             continue
         sample = entry.get("sample")
         value = _safe_float(entry.get("value"))
         if sample is None or value is None:
             continue
-        h_history.append({"sample": sample, "value": value})
+        ts = entry.get("ts")
+        if ts is None and missing_ts_count:
+            # Evenly space backwards from "now" — only ever used for
+            # pre-upgrade entries that never saw the timestamp field.
+            ts = now_ts - (missing_ts_count - idx - 1) * update_interval_s
+        h_history.append({"sample": sample, "value": value, "ts": ts})
 
     # Learning progress
     idle_count = getattr(model, "idle_count", 0)
@@ -606,6 +623,12 @@ def _build_room_detail(
     )
 
     # ── Couplings (multi-room thermal connections) ──
+    #
+    # We forward the *full* coupling spec — closed + open U-values, door
+    # sensor id, live door state, and whether the learner is on — so the
+    # dashboard can render a proper couplings card. The previous payload
+    # only carried ``u_value`` (= u_closed) and ``enabled``, which is why
+    # Sietse couldn't see any of the learned-U state in the frontend.
     couplings_out = []
     for c in getattr(model, "couplings", []) or []:
         nb_entry_id = getattr(c, "neighbour_entry_id", None)
@@ -622,12 +645,27 @@ def _build_room_detail(
                         nb_temp = _safe_float(
                             nb_state.attributes.get("current_temperature")
                         )
+        door_sensor = getattr(c, "door_sensor", None)
+        door_open: bool | None = None
+        if door_sensor:
+            ds_state = hass.states.get(door_sensor)
+            if ds_state is not None:
+                door_open = ds_state.state == "on"
+        u_closed = float(getattr(c, "u_value", 0.0) or 0.0)
+        u_open = float(getattr(c, "u_open", 0.0) or 0.0)
         couplings_out.append(
             {
                 "neighbour_entry_id": nb_entry_id,
                 "neighbour_name": nb_name,
                 "neighbour_temp": nb_temp,
-                "u_value": float(getattr(c, "u_value", 0.0) or 0.0),
+                # Legacy scalar still forwarded for pre-v0.7.1 dashboards.
+                "u_value": u_closed,
+                "u_closed": u_closed,
+                "u_open": u_open,
+                "door_sensor": door_sensor,
+                "door_open": door_open,
+                "active_u": u_open if door_open else u_closed,
+                "learn": bool(getattr(c, "learn", True)),
                 "enabled": bool(getattr(c, "enabled", True)),
             }
         )
@@ -677,9 +715,23 @@ def _build_room_detail(
         "min_active": MIN_ACTIVE_SAMPLES,
         "learning_progress": progress,
         "mean_prediction_error": mean_err_out,
-        "prediction_error_history": list(
-            getattr(model, "prediction_error_history", [])
-        )[-200:],
+        # As with h_history: back-fill ``ts`` for pre-v0.7.1 rows so the
+        # dashboard's time-axis plot has data to work with even on first
+        # upgrade, and so the prediction-error chart can convert to a
+        # drift-per-hour rate on the frontend.
+        "prediction_error_history": [
+            {
+                "sample": e.get("sample"),
+                "value": _safe_float(e.get("value")),
+                "ts": e.get("ts")
+                if e.get("ts") is not None
+                else now_ts - (len(getattr(model, "prediction_error_history", [])) - i - 1) * update_interval_s * 5,
+            }
+            for i, e in enumerate(
+                list(getattr(model, "prediction_error_history", []))[-200:]
+            )
+            if isinstance(e, dict) and e.get("value") is not None
+        ],
         "observations": observations,
         "h_history": h_history,
         "predictions": predictions,

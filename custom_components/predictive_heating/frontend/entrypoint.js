@@ -1677,13 +1677,26 @@ class PredictiveHeatingPanel extends HTMLElement {
         const nbId = c.neighbour_entry_id || "";
         const nbName = c.neighbour_name || "Unknown room";
         const nbTemp = c.neighbour_temp;
-        const u = this._num(c.u_value, 0);
+        // Prefer full spec; fall back to legacy scalar.
+        const uClosed = this._num(
+          c.u_closed != null ? c.u_closed : c.u_value,
+          0,
+        );
+        const uOpen = this._num(c.u_open != null ? c.u_open : uClosed, 0);
+        const doorSensor = c.door_sensor || null;
+        const doorOpen = c.door_open === true;
+        const doorKnown = c.door_open === true || c.door_open === false;
+        const activeU = this._num(
+          c.active_u != null ? c.active_u : uClosed,
+          0,
+        );
+        const learn = c.learn !== false;
         const enabled = c.enabled !== false;
         const dT =
           currentTemp != null && nbTemp != null
             ? this._num(nbTemp, 0) - this._num(currentTemp, 0)
             : null;
-        const flowW = dT != null ? u * dT : null;
+        const flowW = dT != null ? activeU * dT : null;
         const arrow =
           dT == null
             ? "mdi:swap-horizontal"
@@ -1702,18 +1715,43 @@ class PredictiveHeatingPanel extends HTMLElement {
             : dT < 0
             ? `Heat leaking OUT to ${this._escape(nbName)} (you're warmer)`
             : "Neighbour at same temperature";
+        const doorIcon = !doorKnown
+          ? "mdi:door"
+          : doorOpen
+          ? "mdi:door-open"
+          : "mdi:door-closed";
+        const doorLabel = !doorKnown
+          ? doorSensor
+            ? "Door sensor: unknown"
+            : "No door sensor (closed U used)"
+          : doorOpen
+          ? "Door open"
+          : "Door closed";
+        const activeLabel = doorKnown
+          ? doorOpen
+            ? "open"
+            : "closed"
+          : "closed";
         return `
           <div class="coupling-row ${enabled ? "" : "disabled"}">
             <div class="coupling-info">
               <div class="coupling-name">
-                <ha-icon icon="${enabled ? "mdi:door-open" : "mdi:door-closed"}"></ha-icon>
+                <ha-icon icon="${doorIcon}"></ha-icon>
                 <strong>${this._escape(nbName)}</strong>
-                <span class="coupling-uval">U = ${this._fix(u, 1)} W/K</span>
+                <span class="coupling-uval">
+                  U<sub>${activeLabel}</sub> = ${this._fix(activeU, 1)} W/K
+                </span>
               </div>
               <div class="coupling-flow">
                 <ha-icon icon="${arrow}"></ha-icon>
                 <span class="coupling-flow-value">${flowLabel}</span>
                 <span class="coupling-flow-hint">${flowHint}</span>
+              </div>
+              <div class="coupling-sub">
+                U<sub>closed</sub> ${this._fix(uClosed, 1)} W/K
+                · U<sub>open</sub> ${this._fix(uOpen, 1)} W/K
+                · ${this._escape(doorLabel)}
+                · ${learn ? "learning ✓" : "learning off"}
               </div>
               <div class="coupling-sub">
                 Neighbour: ${nbTemp != null ? this._fix(nbTemp, 1) + " °C" : "—"}
@@ -1960,19 +1998,34 @@ class PredictiveHeatingPanel extends HTMLElement {
     const plotW = W - pad.left - pad.right;
     const plotH = H - pad.top - pad.bottom;
 
+    // Each entry is {sample, value, ts}. We now axis on `ts` so samples
+    // spaced unevenly in time don't squash/stretch the curve. Fallback
+    // to sample index only if no entry has a timestamp (pre-upgrade
+    // data that the backend couldn't synthesise a ts for).
     const hist = data.h_history;
-    let yMin = Infinity,
-      yMax = -Infinity;
-    for (const v of hist) {
-      yMin = Math.min(yMin, v.value);
-      yMax = Math.max(yMax, v.value);
-    }
-    const margin = (yMax - yMin) * 0.15 || 10;
+    const hasTs = hist.every((p) => typeof p.ts === "number" && !isNaN(p.ts));
+
+    // Robust y-scaling: if only a handful of points exist, the early
+    // transient dominates the range. Use a 5%–95% percentile window
+    // instead of min/max so a single extreme learner step doesn't
+    // compress the rest of the chart into a flat line (which is what
+    // made the old "varies wildly" look unusable).
+    const values = hist.map((p) => p.value).sort((a, b) => a - b);
+    const pct = (p) => values[Math.max(0, Math.min(values.length - 1, Math.floor(p * values.length)))];
+    let yMin = hist.length > 6 ? pct(0.05) : values[0];
+    let yMax = hist.length > 6 ? pct(0.95) : values[values.length - 1];
+    const margin = Math.max((yMax - yMin) * 0.15, 2);
     yMin -= margin;
     yMax += margin;
     const yRange = yMax - yMin || 1;
 
-    const toX = (i) => pad.left + (i / (hist.length - 1)) * plotW;
+    const tMin = hasTs ? hist[0].ts : 0;
+    const tMax = hasTs ? hist[hist.length - 1].ts : hist.length - 1;
+    const tRange = tMax - tMin || 1;
+    const toX = (i) =>
+      pad.left +
+      ((hasTs ? (hist[i].ts - tMin) : i) / (hasTs ? tRange : Math.max(1, hist.length - 1))) *
+        plotW;
     const toY = (v) => pad.top + (1 - (v - yMin) / yRange) * plotH;
 
     const txtCol = this._themeColor("--secondary-text-color", "#888");
@@ -2002,9 +2055,30 @@ class PredictiveHeatingPanel extends HTMLElement {
     ctx.fillText("W/K", 0, 0);
     ctx.restore();
 
+    // X-axis ticks: up to 5 evenly-spaced wall-clock labels when we
+    // have timestamps; otherwise fall back to the old "Sample #" label.
     ctx.fillStyle = txtCol;
     ctx.textAlign = "center";
-    ctx.fillText("Sample #", W / 2, H - 4);
+    if (hasTs) {
+      const fmtTick = (ts) => {
+        const d = new Date(ts * 1000);
+        // If the span is <24h use HH:MM; otherwise show date+hour.
+        if (tRange < 36 * 3600) {
+          return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        }
+        return d.toLocaleDateString([], { month: "short", day: "numeric" }) +
+          " " +
+          d.toLocaleTimeString([], { hour: "2-digit" });
+      };
+      for (let i = 0; i <= 4; i++) {
+        const f = i / 4;
+        const x = pad.left + f * plotW;
+        const ts = tMin + f * tRange;
+        ctx.fillText(fmtTick(ts), x, H - 6);
+      }
+    } else {
+      ctx.fillText("Sample #", W / 2, H - 4);
+    }
 
     ctx.strokeStyle = lineCol;
     ctx.lineWidth = 2;
@@ -2016,12 +2090,15 @@ class PredictiveHeatingPanel extends HTMLElement {
     }
     ctx.stroke();
 
+    // Only dot every ~8th sample when densely packed — a dot per point
+    // is visually noisy once we're plotting hundreds of H updates.
+    const dotStep = Math.max(1, Math.floor(hist.length / 40));
     ctx.fillStyle = lineCol;
-    for (let i = 0; i < hist.length; i++) {
+    for (let i = 0; i < hist.length; i += dotStep) {
       const x = toX(i);
       const y = toY(hist[i].value);
       ctx.beginPath();
-      ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+      ctx.arc(x, y, 2.0, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -2049,12 +2126,41 @@ class PredictiveHeatingPanel extends HTMLElement {
     const plotW = W - pad.left - pad.right;
     const plotH = H - pad.top - pad.bottom;
 
-    const hist = data.prediction_error_history;
-    const yMax = Math.max(1.0, ...hist.map((h) => h.value)) * 1.1;
+    // Convert raw per-tick error (°C per controller cycle) to a rate
+    // (°C/h) so the chart is interpretable at a glance. The update
+    // interval is tick-constant (defaults to 120 s) — the backend
+    // exposes it so we don't guess.
+    const tickS = this._num(data.update_interval_s, 120);
+    const ratePerH = 3600 / tickS;
+
+    const rawHist = data.prediction_error_history;
+    const hasTs = rawHist.every(
+      (p) => typeof p.ts === "number" && !isNaN(p.ts)
+    );
+    // Drop the first few samples — the EKF's initial transient
+    // produces huge errors that dominate the y-axis scale and make the
+    // rest of the history look flat. After 5 samples the filter has
+    // usually stabilised on a plausible H/C estimate.
+    const hist = rawHist.length > 8 ? rawHist.slice(Math.min(5, rawHist.length - 2)) : rawHist;
+
+    // Robust y-scaling: use the 95th percentile instead of max so one
+    // remaining spike doesn't flatten the rest of the curve. Clamp the
+    // upper bound at a reasonable floor so we still see the curve when
+    // errors are tiny.
+    const vals = hist.map((p) => p.value * ratePerH).sort((a, b) => a - b);
+    const p95 = vals[Math.max(0, Math.floor(vals.length * 0.95) - 1)] || 0;
+    const yMax = Math.max(0.2, p95 * 1.15);
     const yMin = 0;
     const yRange = yMax - yMin;
 
-    const toX = (i) => pad.left + (i / (hist.length - 1)) * plotW;
+    const tMin = hasTs ? hist[0].ts : 0;
+    const tMax = hasTs ? hist[hist.length - 1].ts : hist.length - 1;
+    const tRange = tMax - tMin || 1;
+    const toX = (i) =>
+      pad.left +
+      ((hasTs ? (hist[i].ts - tMin) : i) /
+        (hasTs ? tRange : Math.max(1, hist.length - 1))) *
+        plotW;
     const toY = (v) => pad.top + (1 - (v - yMin) / yRange) * plotH;
 
     const txtCol = this._themeColor("--secondary-text-color", "#888");
@@ -2074,19 +2180,24 @@ class PredictiveHeatingPanel extends HTMLElement {
       ctx.stroke();
       ctx.fillStyle = txtCol;
       ctx.textAlign = "right";
-      ctx.fillText(v.toFixed(2) + "°", pad.left - 8, y + 4);
+      ctx.fillText(v.toFixed(2) + " °C/h", pad.left - 8, y + 4);
     }
 
-    // Calibration threshold
-    ctx.strokeStyle = okCol;
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([6, 4]);
-    ctx.beginPath();
-    const threshY = toY(0.5);
-    ctx.moveTo(pad.left, threshY);
-    ctx.lineTo(W - pad.right, threshY);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    // Calibration threshold line — the backend calibrates when mean
+    // abs. error < 0.5 °C *per tick*, so the line on a rate axis is at
+    // 0.5 °C/tick × rate_per_h.
+    const calibRate = 0.5 * ratePerH;
+    if (calibRate <= yMax) {
+      ctx.strokeStyle = okCol;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      const threshY = toY(calibRate);
+      ctx.moveTo(pad.left, threshY);
+      ctx.lineTo(W - pad.right, threshY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
 
     // Error line
     ctx.strokeStyle = errCol;
@@ -2094,17 +2205,38 @@ class PredictiveHeatingPanel extends HTMLElement {
     ctx.beginPath();
     for (let i = 0; i < hist.length; i++) {
       const x = toX(i);
-      const y = toY(hist[i].value);
+      const y = toY(hist[i].value * ratePerH);
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     }
     ctx.stroke();
+
+    ctx.fillStyle = txtCol;
+    ctx.textAlign = "center";
+    if (hasTs) {
+      const fmtTick = (ts) => {
+        const d = new Date(ts * 1000);
+        if (tRange < 36 * 3600) {
+          return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        }
+        return d.toLocaleDateString([], { month: "short", day: "numeric" }) +
+          " " + d.toLocaleTimeString([], { hour: "2-digit" });
+      };
+      for (let i = 0; i <= 4; i++) {
+        const f = i / 4;
+        const x = pad.left + f * plotW;
+        const ts = tMin + f * tRange;
+        ctx.fillText(fmtTick(ts), x, H - 6);
+      }
+    } else {
+      ctx.fillText("Sample #", W / 2, H - 4);
+    }
 
     ctx.save();
     ctx.translate(14, H / 2);
     ctx.rotate(-Math.PI / 2);
     ctx.fillStyle = txtCol;
     ctx.textAlign = "center";
-    ctx.fillText("°C error", 0, 0);
+    ctx.fillText("°C drift per hour", 0, 0);
     ctx.restore();
   }
 
@@ -2288,8 +2420,11 @@ class PredictiveHeatingPanel extends HTMLElement {
     }
   }
 
-  // Plot the 24 h predictive simulation trajectory (indoor temp, heating
-  // on/off shading, target line).
+  // Plot the predictive simulation chart with the last 24 h of observed
+  // indoor temperature on the left of "now", and the 24 h forecast on
+  // the right. A dashed vertical "now" marker separates past from
+  // future. The y-axis spans both the observed history and the forecast
+  // so both share the same temperature scale.
   _drawSimulationChart(data) {
     const canvas = this.shadowRoot.getElementById("simulation-chart");
     if (!canvas) return;
@@ -2318,6 +2453,29 @@ class PredictiveHeatingPanel extends HTMLElement {
       this._num(traj[traj.length - 1].t, 24);
     const targetTemp = data.target_temp;
 
+    // "Now" reference time (seconds since epoch). Simulation timestamps
+    // are relative to sim.generated_ts — if it's missing we fall back to
+    // the current wall-clock time, which keeps pre-upgrade simulations
+    // usable but may shift the past-history curve by a few minutes.
+    const nowTs = this._num(sim.generated_ts, Date.now() / 1000);
+
+    // Past window: last 24 h of observations mapped to the [-24, 0] range.
+    const pastHours = 24;
+    const obs = Array.isArray(data.observations) ? data.observations : [];
+    const past = [];
+    for (const o of obs) {
+      const ts = this._num(o && o.timestamp, 0);
+      if (!ts) continue;
+      const deltaH = (ts - nowTs) / 3600;
+      if (deltaH >= -pastHours && deltaH <= 0) {
+        const v = this._num(o.t_indoor, null);
+        if (v == null || !Number.isFinite(v)) continue;
+        past.push({ t: deltaH, temperature: v, heating_on: !!o.heating_on });
+      }
+    }
+    past.sort((a, b) => a.t - b.t);
+
+    // y-range: unify past observations + forecast trajectory + targets.
     let yMin = Infinity,
       yMax = -Infinity;
     for (const pt of traj) {
@@ -2325,15 +2483,27 @@ class PredictiveHeatingPanel extends HTMLElement {
       yMin = Math.min(yMin, v);
       yMax = Math.max(yMax, v);
     }
+    for (const pt of past) {
+      yMin = Math.min(yMin, pt.temperature);
+      yMax = Math.max(yMax, pt.temperature);
+    }
     if (targetTemp != null) {
       yMin = Math.min(yMin, this._num(targetTemp, 0));
       yMax = Math.max(yMax, this._num(targetTemp, 0));
+    }
+    if (!Number.isFinite(yMin) || !Number.isFinite(yMax)) {
+      yMin = 15;
+      yMax = 22;
     }
     yMin = Math.floor(yMin - 1);
     yMax = Math.ceil(yMax + 1);
     const yRange = yMax - yMin || 1;
 
-    const toX = (t) => pad.left + (t / horizon) * plotW;
+    // X-range spans the whole [-pastHours, +horizon] interval.
+    const xMin = -pastHours;
+    const xMax = horizon;
+    const xRange = xMax - xMin || 1;
+    const toX = (t) => pad.left + ((t - xMin) / xRange) * plotW;
     const toY = (v) => pad.top + (1 - (v - yMin) / yRange) * plotH;
 
     const txtCol = this._themeColor("--secondary-text-color", "#888");
@@ -2341,7 +2511,14 @@ class PredictiveHeatingPanel extends HTMLElement {
     const indoor = this._themeColor("--primary-color", "#03a9f4");
     const target = this._themeColor("--accent-color", "#ff9800");
     const heatCol = this._themeColor("--error-color", "#f44336");
+    const pastCol = this._themeColor("--secondary-text-color", "#666");
 
+    // Past-half background shading so the observed region reads as
+    // "history" at a glance.
+    ctx.fillStyle = this._withAlpha(txtCol, 0.04);
+    ctx.fillRect(pad.left, pad.top, toX(0) - pad.left, plotH);
+
+    // Y grid + labels
     ctx.strokeStyle = gridCol;
     ctx.lineWidth = 1;
     ctx.font = "11px var(--paper-font-body1_-_font-family, sans-serif)";
@@ -2357,29 +2534,47 @@ class PredictiveHeatingPanel extends HTMLElement {
       ctx.fillText(v.toFixed(1) + "°", pad.left - 8, y + 4);
     }
 
-    // X labels — every 4h
+    // X labels — ticks every 6h across past+future, plus an explicit
+    // "now" tick at t=0.
     ctx.textAlign = "center";
     ctx.fillStyle = txtCol;
-    const step = horizon <= 12 ? 2 : 4;
-    for (let h = 0; h <= horizon; h += step) {
+    const tickStep = 6;
+    for (let h = Math.ceil(xMin / tickStep) * tickStep; h <= xMax; h += tickStep) {
       const x = toX(h);
-      ctx.fillText(`+${h}h`, x, H - pad.bottom + 20);
+      let label;
+      if (h === 0) label = "now";
+      else if (h < 0) label = `-${Math.abs(h)}h`;
+      else label = `+${h}h`;
+      ctx.fillText(label, x, H - pad.bottom + 20);
     }
 
-    // Heating shading — where heating_fraction > 0.05.
-    ctx.fillStyle = this._withAlpha(heatCol, 0.15);
-    for (let i = 0; i < traj.length - 1; i++) {
-      const hf = this._num(traj[i].heating_fraction, 0);
-      if (hf > 0.05) {
-        const x1 = toX(this._num(traj[i].t, 0));
-        const x2 = toX(this._num(traj[i + 1].t, 0));
-        ctx.fillRect(x1, pad.top, x2 - x1, plotH);
+    // Past heating shading (observed heating_on periods).
+    ctx.fillStyle = this._withAlpha(heatCol, 0.12);
+    for (let i = 0; i < past.length - 1; i++) {
+      if (past[i].heating_on) {
+        const x1 = toX(past[i].t);
+        const x2 = toX(past[i + 1].t);
+        ctx.fillRect(x1, pad.top, Math.max(1, x2 - x1), plotH);
       }
     }
 
-    // Target line — walk the per-step setpoint so scheduled transitions
-    // are visible as steps in the orange dashed line, rather than a
-    // single flat target.
+    // Forecast heating shading — where heat_fraction > 0.05.
+    ctx.fillStyle = this._withAlpha(heatCol, 0.15);
+    for (let i = 0; i < traj.length - 1; i++) {
+      const hf = this._num(
+        traj[i].heating_fraction != null
+          ? traj[i].heating_fraction
+          : traj[i].heat_fraction,
+        0,
+      );
+      if (hf > 0.05) {
+        const x1 = toX(this._num(traj[i].t, 0));
+        const x2 = toX(this._num(traj[i + 1].t, 0));
+        ctx.fillRect(x1, pad.top, Math.max(1, x2 - x1), plotH);
+      }
+    }
+
+    // Target line — only forecast side carries setpoint info.
     ctx.strokeStyle = target;
     ctx.lineWidth = 1.5;
     ctx.setLineDash([6, 4]);
@@ -2405,7 +2600,21 @@ class PredictiveHeatingPanel extends HTMLElement {
     if (drewAny) ctx.stroke();
     ctx.setLineDash([]);
 
-    // Indoor forecast line
+    // Past observed indoor line — solid, muted colour so the forecast
+    // remains the visual focus.
+    if (past.length >= 2) {
+      ctx.strokeStyle = pastCol;
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      for (let i = 0; i < past.length; i++) {
+        const x = toX(past[i].t);
+        const y = toY(past[i].temperature);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+
+    // Forecast indoor line — primary colour, slightly thicker.
     ctx.strokeStyle = indoor;
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -2415,6 +2624,26 @@ class PredictiveHeatingPanel extends HTMLElement {
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     }
     ctx.stroke();
+
+    // "Now" marker — dashed vertical line at t=0 with label on top.
+    const xNow = toX(0);
+    ctx.save();
+    ctx.strokeStyle = txtCol;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(xNow, pad.top);
+    ctx.lineTo(xNow, H - pad.bottom);
+    ctx.stroke();
+    ctx.restore();
+
+    // Legend (tiny, top-right).
+    ctx.textAlign = "right";
+    ctx.font = "10px var(--paper-font-body1_-_font-family, sans-serif)";
+    ctx.fillStyle = pastCol;
+    ctx.fillText("— past 24h", W - pad.right, pad.top - 6);
+    ctx.fillStyle = indoor;
+    ctx.fillText("— forecast", W - pad.right - 70, pad.top - 6);
   }
 
   _withAlpha(color, alpha) {

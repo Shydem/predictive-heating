@@ -36,52 +36,87 @@
   "options": {
     "step": {
       "init": {
-        "title": "Temperature & Control Settings",
+        "title": "Predictive Heating — Room options",
+        "description": "Pick what to configure.",
+        "menu_options": {
+          "main": "Temperatures, schedule & control",
+          "couplings": "Room-to-room thermal couplings"
+        }
+      },
+      "main": {
+        "title": "Temperatures, schedule & control",
         "data": {
-          "room_name": "Room Name",
-          "comfort_temp": "Comfort Temperature",
-          "eco_temp": "Eco Temperature",
-          "away_temp": "Away Temperature",
-          "sleep_temp": "Sleep Temperature",
-          "max_setpoint_delta": "Max setpoint offset above target",
-          "nudge_step": "Setpoint nudge step",
+          "room_name": "Room name",
+          "comfort_temp": "Comfort temperature (°C)",
+          "eco_temp": "Eco temperature (°C)",
+          "away_temp": "Away temperature (°C)",
+          "sleep_temp": "Sleep temperature (°C)",
+          "max_setpoint_delta": "Max setpoint offset above target (°C)",
+          "nudge_step": "Setpoint nudge step (°C)",
           "nudge_interval_min": "Minutes between nudges",
-          "gas_meter_sensor": "Gas Meter (cumulative m³)",
+          "window_sensors": "Window/door sensors",
+          "gas_meter_sensor": "Gas meter (cumulative m³)",
           "boiler_efficiency": "Boiler efficiency (0–1)",
           "heat_share": "Fraction of boiler heat going to this room",
           "gas_calorific_value_mj_m3": "Gas calorific value (MJ/m³)",
-          "floor_area_m2": "Floor Area (m²)",
-          "ceiling_height_m": "Ceiling Height (m)",
-          "building_type": "Building Type",
           "schedule_entity": "Schedule entity to follow",
-          "schedule_on_temp": "Temperature when schedule is ON",
-          "schedule_off_temp": "Temperature when schedule is OFF",
+          "schedule_on_temp": "Temperature when schedule is ON (fallback)",
+          "schedule_off_temp": "Temperature when schedule is OFF (fallback)",
           "weather_entity": "Weather entity (for outdoor forecast)",
           "person_entities": "Person entities (for Away auto-switching)",
           "away_grace_min": "Minutes before switching to Away when nobody home",
           "comfort_ramp": "Comfort ramp style",
           "control_mode": "Control mode",
-          "max_preheat_nudge": "Max pre-heat nudge above target"
+          "max_preheat_nudge": "Max pre-heat nudge above target (°C)",
+          "floor_area_m2": "Floor area (m²)",
+          "ceiling_height_m": "Ceiling height (m)",
+          "building_type": "Building type"
         },
         "data_description": {
           "room_name": "Renaming a room keeps all learned thermal properties — only the displayed name changes.",
-          "max_setpoint_delta": "How far the thermostat setpoint is allowed to drift above target. Small values (≤1°C) preserve OpenTherm modulation so the boiler/heat pump runs at the efficient flow temperature. Default 1.0°C.",
-          "nudge_step": "How much to change the thermostat setpoint when a correction is needed. Defaults to 0.5°C — small enough to keep OpenTherm happy but noticeable.",
+          "max_setpoint_delta": "How far the thermostat setpoint is allowed to drift above target. Small values (≤1 °C) preserve OpenTherm modulation so the heat pump / boiler runs at its efficient flow temperature. Default 1.0 °C.",
+          "nudge_step": "How much to change the thermostat setpoint when a correction is needed. Defaults to 0.5 °C — small enough to keep OpenTherm happy but noticeable.",
           "nudge_interval_min": "Minimum minutes between setpoint adjustments. Gives the boiler time to react before the next nudge.",
+          "window_sensors": "Binary sensors whose 'on' state means a window/door is open. The room auto-drops to a safety setpoint and the controller shuts off when any of these report open.",
           "gas_meter_sensor": "Cumulative gas meter entity. Derivative → watts of heat delivered. Leave blank to fall back to binary heating on/off.",
           "boiler_efficiency": "Condensing boiler ≈ 0.95; non-condensing ≈ 0.85.",
           "heat_share": "When multiple rooms share one boiler, split the boiler heat between them (total should ≈ 1.0).",
-          "floor_area_m2": "Used as an initial estimate for heat loss (H) and thermal mass (C). Only applied when the model hasn't learned anything yet.",
-          "building_type": "Insulation quality category. Only affects the initial estimate — the EKF takes over once it has observations.",
-          "schedule_entity": "Leave blank to set the temperature manually. When set, the room target follows this schedule entity's ON/OFF state. If the schedule slot defines a `temperature` attribute, that wins over the on/off defaults.",
-          "schedule_on_temp": "Target temperature while the schedule entity is ON. Defaults to the Comfort temperature.",
-          "schedule_off_temp": "Target temperature while the schedule entity is OFF. Defaults to the Eco temperature.",
-          "weather_entity": "HA weather.* entity. The planner reads its hourly forecast to extend pre-heat time on cold nights.",
+          "schedule_entity": "Leave blank to set the temperature manually. When set, the room target follows this schedule entity's preset (if the slot carries 'preset'/'preset_mode'/'mode') or falls back to the on/off temperatures below.",
+          "schedule_on_temp": "Used only when the schedule slot does NOT specify a preset name. Defaults to the Comfort preset.",
+          "schedule_off_temp": "Used only when the schedule slot does NOT specify a preset name. Defaults to the Eco preset.",
+          "weather_entity": "HA weather.* entity. The pre-heat planner reads its hourly forecast to extend pre-heat time on cold nights.",
           "person_entities": "When every listed person is away past the grace period the room switches to Away. When anyone returns the previous preset is restored automatically.",
           "away_grace_min": "Prevents a momentary GPS/phone glitch from cooling the room down. Default 10 min.",
           "comfort_ramp": "gradual: target temp ramps linearly from low to high over the pre-heat window. instant: jumps to the high target at the start of the window.",
           "control_mode": "observe: never writes to the thermostat — the integration only monitors and predicts. follow: writes the scheduled preset temperature to the thermostat, plus a small pre-heat nudge when needed so the room reaches the target on time.",
-          "max_preheat_nudge": "Upper bound on how far above the scheduled target the pre-heat planner is allowed to push the setpoint while ramping in. Keep small (≤0.5 °C) so the heat pump stays in its efficient modulating range. Set to 0 to disable pre-heat nudges."
+          "max_preheat_nudge": "Upper bound on how far above the scheduled target the pre-heat planner is allowed to push the setpoint while ramping in. Keep small (≤0.5 °C) so the heat pump stays in its efficient modulating range. Set to 0 to disable pre-heat nudges.",
+          "floor_area_m2": "Used as an initial estimate for heat loss (H) and thermal mass (C). Only applied when the model hasn't learned anything yet.",
+          "building_type": "Insulation quality category. Only affects the initial estimate — the EKF takes over once it has observations."
+        }
+      },
+      "couplings": {
+        "title": "Thermal couplings",
+        "description": "Pick a neighbour to configure the partition between this room and it. The label shows the current U-values (closed/open, W/K) and whether the learner is on.",
+        "data": {
+          "neighbour": "Neighbour to edit"
+        }
+      },
+      "couple_edit": {
+        "title": "Edit coupling: {neighbour_name}",
+        "description": "Configures the heat exchange between this room and {neighbour_name}. U-values are in W/K — closed solid door ≈ 10–20, glazed door ≈ 20–40, open doorway ≈ 60–150. Enable 'learn' to let the integration refine these values from observations. Changes are mirrored to {neighbour_name} automatically.",
+        "data": {
+          "enabled": "Include this coupling in the model",
+          "u_closed": "U when door closed (W/K)",
+          "u_open": "U when door open (W/K)",
+          "door_sensor": "Door sensor (binary_sensor.*, optional)",
+          "learn": "Auto-learn U from observations"
+        },
+        "data_description": {
+          "enabled": "When off, the partition is declared but ignored in the thermal math — useful to temporarily disconnect a neighbour.",
+          "u_closed": "Heat conductance while the door is closed. A solid interior door is ~10–20 W/K; a glazed door is 20–40; no door at all is closer to the 'open' value.",
+          "u_open": "Heat conductance while the door is open. A normal doorway is 60–150 W/K.",
+          "door_sensor": "Optional binary sensor reporting the door's open/closed state. Without a sensor the closed value is always used. Coupling values are mirrored to the neighbour automatically.",
+          "learn": "Nudges u_closed / u_open toward the values that best explain the observed cross-room temperature differences. Uncheck to freeze them at the current value."
         }
       }
     }

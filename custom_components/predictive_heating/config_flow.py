@@ -571,93 +571,39 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
-        """Edit thermal couplings to neighbouring rooms.
+        """Pick a neighbour to edit a coupling for.
 
-        For every *other* predictive-heating config entry we render a small
-        group of fields:
+        HA's translation framework requires *stable* field keys — keys that
+        include an entry_id (``couple_<entry_id>_u_closed``) cannot be
+        translated because the entry_id is unknown at translation-file
+        authoring time. We therefore split coupling editing into two steps:
 
-          * ``couple_<entry_id>_enabled`` — whether heat exchange with this
-            neighbour is modelled at all.
-          * ``couple_<entry_id>_u_closed`` — conductance in W/K when the door
-            between the two rooms is closed (or always, if no door sensor).
-            Closed solid door ≈ 10–20 W/K, glazed door ≈ 20–40.
-          * ``couple_<entry_id>_u_open`` — conductance when the door is open.
-            Typical open doorway ≈ 60–150 W/K.
-          * ``couple_<entry_id>_door_sensor`` — optional binary_sensor used to
-            pick between u_closed and u_open live.
-          * ``couple_<entry_id>_learn`` — whether the online learner is
-            allowed to refine u_closed/u_open from observed thermal drift.
+          1. ``async_step_couplings`` (this method): a one-field form whose
+             only field (``neighbour``) is a SelectSelector listing every
+             other configured room. Submitting it routes to
+             ``async_step_couple_edit`` with the picked neighbour stashed on
+             ``self._selected_neighbour_id``.
+          2. ``async_step_couple_edit``: a per-neighbour form with five
+             *stable* keys (``enabled``, ``u_closed``, ``u_open``,
+             ``door_sensor``, ``learn``) — all translatable via
+             ``options.step.couple_edit.data.*``.
 
-        On submit we serialise to a list of dicts under
-        ``CONF_THERMAL_COUPLINGS`` in the entry's options:
-        ``{neighbour_entry_id, enabled, u_closed, u_open, door_sensor, learn}``.
-        We also keep writing the legacy ``u_value`` key (= u_closed) so older
-        builds of the runtime loader stay compatible during rollout.
+        The selected neighbour name is carried into the next step through
+        ``description_placeholders`` so the ``couple_edit`` title/description
+        can include it.
         """
-        # Build the list of neighbour entries once per render so we know
-        # which keys to read back when the user submits the form.
+        # Build the list of neighbour entries once per render.
         neighbours: list[tuple[str, str]] = []
         for entry in self.hass.config_entries.async_entries(DOMAIN):
             if entry.entry_id == self.config_entry.entry_id:
                 continue
-            # ``entry.title`` is the room name (see async_step_user).
             title = entry.title or entry.data.get(CONF_ROOM_NAME) or entry.entry_id
             neighbours.append((entry.entry_id, title))
         neighbours.sort(key=lambda pair: pair[1].lower())
 
-        if user_input is not None:
-            couplings: list[dict[str, Any]] = []
-            for entry_id, _title in neighbours:
-                enabled = bool(user_input.get(f"couple_{entry_id}_enabled", False))
-
-                def _read_float(key: str, fallback: float) -> float:
-                    try:
-                        return float(user_input.get(key, fallback))
-                    except (TypeError, ValueError):
-                        return fallback
-
-                u_closed = _read_float(
-                    f"couple_{entry_id}_u_closed", DEFAULT_COUPLING_U_CLOSED
-                )
-                u_open = _read_float(
-                    f"couple_{entry_id}_u_open", DEFAULT_COUPLING_U_OPEN
-                )
-                # Clamp — schema enforces this but be defensive since the
-                # options flow input is essentially user-controlled JSON.
-                u_closed = max(0.0, min(500.0, u_closed))
-                u_open = max(0.0, min(500.0, u_open))
-                # Physically, an open door conducts more heat than a closed
-                # one. If the user (or a stale default) violates that, push
-                # u_open up to at least u_closed so the learner starts from
-                # a sane prior.
-                if u_open < u_closed:
-                    u_open = u_closed
-
-                door_sensor = user_input.get(f"couple_{entry_id}_door_sensor") or None
-                learn = bool(user_input.get(f"couple_{entry_id}_learn", True))
-
-                couplings.append(
-                    {
-                        "neighbour_entry_id": entry_id,
-                        "enabled": enabled,
-                        "u_closed": u_closed,
-                        "u_open": u_open,
-                        # Legacy key — older thermal_model builds read
-                        # ``u_value`` instead of ``u_closed``. Keep it in sync
-                        # so rollbacks and partial upgrades don't misread.
-                        "u_value": u_closed,
-                        "door_sensor": door_sensor,
-                        "learn": learn,
-                    }
-                )
-
-            # Merge with whatever else was already in options — we must
-            # not blow away unrelated keys by returning only couplings.
-            new_options = dict(self.config_entry.options)
-            new_options[CONF_THERMAL_COUPLINGS] = couplings
-            return self.async_create_entry(title="", data=new_options)
-
-        # No other rooms configured — show an empty form with a note.
+        # No neighbours yet → show an empty, info-only form and bail.
+        # Returning here (instead of raising) lets the user click back
+        # without ever entering couple_edit.
         if not neighbours:
             return self.async_show_form(
                 step_id="couplings",
@@ -672,100 +618,216 @@ class PredictiveHeatingOptionsFlow(config_entries.OptionsFlow):
                 errors={"base": "no_neighbours"},
             )
 
-        # Build current state lookup so defaults reflect what's saved.
+        if user_input is not None:
+            selected = user_input.get("neighbour")
+            if selected:
+                # Stash on the flow handler so couple_edit knows which
+                # neighbour to render without re-asking.
+                self._selected_neighbour_id = selected
+                return await self.async_step_couple_edit()
+
+        # Summarise each coupling's current state in the dropdown label so
+        # the user sees "Slaapkamer — 15 W/K (closed), learning" instead of
+        # a bare room name. This makes the picker a status-at-a-glance view.
         existing: dict[str, dict[str, Any]] = {}
         for row in self.config_entry.options.get(CONF_THERMAL_COUPLINGS, []) or []:
             nid = row.get("neighbour_entry_id")
             if nid:
                 existing[nid] = row
 
-        schema_dict: dict[Any, Any] = {}
-        for entry_id, title in neighbours:
-            saved = existing.get(entry_id, {})
+        def _label_for(entry_id: str, title: str) -> str:
+            row = existing.get(entry_id)
+            if not row or not row.get("enabled"):
+                return f"{title} — (not linked)"
+            u_closed = row.get("u_closed", row.get("u_value", DEFAULT_COUPLING_U_CLOSED))
+            u_open = row.get("u_open", DEFAULT_COUPLING_U_OPEN)
+            door = "door" if row.get("door_sensor") else "no-door"
+            learn = "learning" if row.get("learn", True) else "frozen"
+            return (
+                f"{title} — {int(round(float(u_closed)))}/{int(round(float(u_open)))}"
+                f" W/K ({door}, {learn})"
+            )
 
-            # Resolve defaults with v0.6 back-compat: if only the old
-            # ``u_value`` field is present, use it as the u_closed default
-            # and fall back to DEFAULT_COUPLING_U_OPEN for u_open.
-            legacy_u = saved.get("u_value")
-            u_closed_default = float(
-                saved.get(
-                    "u_closed",
-                    legacy_u if legacy_u is not None else DEFAULT_COUPLING_U_CLOSED,
-                )
+        options_list = [
+            selector.SelectOptionDict(
+                value=entry_id,
+                label=_label_for(entry_id, title),
             )
-            u_open_default = float(
-                saved.get("u_open", DEFAULT_COUPLING_U_OPEN)
-            )
-            door_sensor_default = saved.get("door_sensor") or vol.UNDEFINED
-            learn_default = bool(saved.get("learn", True))
+            for entry_id, title in neighbours
+        ]
 
-            schema_dict[
-                vol.Optional(
-                    f"couple_{entry_id}_enabled",
-                    default=bool(saved.get("enabled", False)),
-                    description={"suggested_value": bool(saved.get("enabled", False))},
-                )
-            ] = selector.BooleanSelector()
-            schema_dict[
-                vol.Optional(
-                    f"couple_{entry_id}_u_closed",
-                    default=u_closed_default,
-                )
-            ] = selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0.0,
-                    max=200.0,
-                    step=1.0,
-                    unit_of_measurement="W/K",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
-            )
-            schema_dict[
-                vol.Optional(
-                    f"couple_{entry_id}_u_open",
-                    default=u_open_default,
-                )
-            ] = selector.NumberSelector(
-                selector.NumberSelectorConfig(
-                    min=0.0,
-                    max=400.0,
-                    step=1.0,
-                    unit_of_measurement="W/K",
-                    mode=selector.NumberSelectorMode.BOX,
-                )
-            )
-            schema_dict[
-                vol.Optional(
-                    f"couple_{entry_id}_door_sensor",
-                    default=door_sensor_default,
-                )
-            ] = selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="binary_sensor")
-            )
-            schema_dict[
-                vol.Optional(
-                    f"couple_{entry_id}_learn",
-                    default=learn_default,
-                )
-            ] = selector.BooleanSelector()
-            # A blank spacer — in HA's forms there's no header element,
-            # so we rely on field order and the label prefix ("couple_"
-            # + room name) to communicate grouping. Labels come from
-            # translations; absent those, HA shows the raw key, which
-            # is already reasonably self-describing.
-            # (No actual spacer inserted — voluptuous schemas don't
-            # support that — this comment documents intent.)
-
-        # Render labels: HA's form renderer will fall back to the raw
-        # key unless a translation file supplies a label. Provide a
-        # description_placeholders table so the template can interpolate
-        # neighbour names if the user ships a translation later.
-        placeholders = {
-            f"name_{eid}": name for eid, name in neighbours
-        }
+        schema = vol.Schema(
+            {
+                vol.Required("neighbour"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=options_list,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+            }
+        )
 
         return self.async_show_form(
             step_id="couplings",
-            data_schema=vol.Schema(schema_dict),
-            description_placeholders=placeholders,
+            data_schema=schema,
+        )
+
+    async def async_step_couple_edit(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Edit the coupling to a single neighbour.
+
+        Entered from ``async_step_couplings`` with
+        ``self._selected_neighbour_id`` set. Submit merges the updated row
+        into ``CONF_THERMAL_COUPLINGS`` on this entry's options AND mirrors
+        the same row (with ``neighbour_entry_id`` swapped) onto the
+        neighbour's options — thermal coupling is inherently symmetric, so
+        editing one side must keep both in sync. Without the mirror, only
+        one room would include the heat-exchange term in its EKF, giving
+        asymmetric learned parameters and dashboard noise.
+        """
+        neighbour_id = getattr(self, "_selected_neighbour_id", None)
+        if not neighbour_id:
+            # Reloaded mid-flow without a selection — bounce back to the
+            # menu. This also covers the "direct URL" case if HA ever
+            # routed a user here without going through couplings first.
+            return await self.async_step_couplings()
+
+        # Resolve the neighbour entry to show its name in the title.
+        neighbour_entry = self.hass.config_entries.async_get_entry(neighbour_id)
+        neighbour_name = (
+            neighbour_entry.title
+            if neighbour_entry is not None
+            else neighbour_id
+        )
+
+        # Load current state for defaults.
+        existing: dict[str, dict[str, Any]] = {}
+        for row in self.config_entry.options.get(CONF_THERMAL_COUPLINGS, []) or []:
+            nid = row.get("neighbour_entry_id")
+            if nid:
+                existing[nid] = row
+        saved = existing.get(neighbour_id, {})
+
+        if user_input is not None:
+            enabled = bool(user_input.get("enabled", False))
+
+            def _read_float(key: str, fallback: float) -> float:
+                try:
+                    return float(user_input.get(key, fallback))
+                except (TypeError, ValueError):
+                    return fallback
+
+            u_closed = _read_float("u_closed", DEFAULT_COUPLING_U_CLOSED)
+            u_open = _read_float("u_open", DEFAULT_COUPLING_U_OPEN)
+            u_closed = max(0.0, min(500.0, u_closed))
+            u_open = max(0.0, min(500.0, u_open))
+            # Open conductance cannot be lower than closed — clamp up so
+            # the learner starts from a physically plausible prior.
+            if u_open < u_closed:
+                u_open = u_closed
+
+            door_sensor = user_input.get("door_sensor") or None
+            learn = bool(user_input.get("learn", True))
+
+            new_row = {
+                "neighbour_entry_id": neighbour_id,
+                "enabled": enabled,
+                "u_closed": u_closed,
+                "u_open": u_open,
+                # Legacy key — older thermal_model builds read ``u_value``.
+                "u_value": u_closed,
+                "door_sensor": door_sensor,
+                "learn": learn,
+            }
+
+            # Merge into *this* entry's options.
+            new_options = dict(self.config_entry.options)
+            couplings = list(new_options.get(CONF_THERMAL_COUPLINGS, []) or [])
+            couplings = [
+                c for c in couplings if c.get("neighbour_entry_id") != neighbour_id
+            ]
+            couplings.append(new_row)
+            new_options[CONF_THERMAL_COUPLINGS] = couplings
+
+            # Mirror to the neighbour's options — same row but with the
+            # self<->neighbour direction flipped. Without this, U-values
+            # would be asymmetric and both rooms' learners would disagree.
+            if neighbour_entry is not None:
+                mirror_row = dict(new_row)
+                mirror_row["neighbour_entry_id"] = self.config_entry.entry_id
+                neighbour_options = dict(neighbour_entry.options)
+                nb_couplings = list(
+                    neighbour_options.get(CONF_THERMAL_COUPLINGS, []) or []
+                )
+                nb_couplings = [
+                    c
+                    for c in nb_couplings
+                    if c.get("neighbour_entry_id") != self.config_entry.entry_id
+                ]
+                nb_couplings.append(mirror_row)
+                neighbour_options[CONF_THERMAL_COUPLINGS] = nb_couplings
+                self.hass.config_entries.async_update_entry(
+                    neighbour_entry,
+                    options=neighbour_options,
+                )
+                # Ask HA to reload the neighbour so the mirrored coupling
+                # takes effect immediately — otherwise the new U-values
+                # would only appear after a restart / manual reload.
+                self.hass.async_create_task(
+                    self.hass.config_entries.async_reload(neighbour_entry.entry_id)
+                )
+
+            # Clear the selection so navigating back to couplings works
+            # cleanly and create_entry writes this entry's options.
+            self._selected_neighbour_id = None
+            return self.async_create_entry(title="", data=new_options)
+
+        # Build defaults from saved state (with v0.6 back-compat).
+        legacy_u = saved.get("u_value")
+        u_closed_default = float(
+            saved.get(
+                "u_closed",
+                legacy_u if legacy_u is not None else DEFAULT_COUPLING_U_CLOSED,
+            )
+        )
+        u_open_default = float(saved.get("u_open", DEFAULT_COUPLING_U_OPEN))
+        door_sensor_default = saved.get("door_sensor") or vol.UNDEFINED
+        learn_default = bool(saved.get("learn", True))
+        enabled_default = bool(saved.get("enabled", False))
+
+        schema = vol.Schema(
+            {
+                vol.Optional("enabled", default=enabled_default):
+                    selector.BooleanSelector(),
+                vol.Optional("u_closed", default=u_closed_default):
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0.0, max=200.0, step=1.0,
+                            unit_of_measurement="W/K",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                vol.Optional("u_open", default=u_open_default):
+                    selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0.0, max=400.0, step=1.0,
+                            unit_of_measurement="W/K",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                vol.Optional("door_sensor", default=door_sensor_default):
+                    selector.EntitySelector(
+                        selector.EntitySelectorConfig(domain="binary_sensor")
+                    ),
+                vol.Optional("learn", default=learn_default):
+                    selector.BooleanSelector(),
+            }
+        )
+
+        return self.async_show_form(
+            step_id="couple_edit",
+            data_schema=schema,
+            description_placeholders={"neighbour_name": neighbour_name},
         )

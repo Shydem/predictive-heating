@@ -836,7 +836,24 @@ class PredictiveHeatingClimate(ClimateEntity):
         return None
 
     def _apply_preheat_plan(self) -> None:
-        """Run the preheat planner and push the effective target to the controller."""
+        """Run the preheat planner and push the effective target to the controller.
+
+        **Override short-circuit:** when ``self._override_on`` is True, the
+        user (or an external automation) has explicitly pinned the room to
+        the Comfort preset. In that case the schedule-driven pre-heat
+        planner must NOT overwrite the target — otherwise the target would
+        oscillate between Comfort (set by the override handler) and the
+        schedule's scheduled-off temperature (set back by this method),
+        effectively neutralising the override. The controller + HVAC action
+        are not disturbed here; they'll be refreshed via the periodic tick.
+        """
+        if self._override_on:
+            # Leave target / controller alone — override owns the setpoint
+            # until the switch is released. Still clear the cached plan so
+            # the dashboard reflects "no pre-heat while overridden".
+            self._last_preheat_plan = None
+            return
+
         low, high = self._schedule_targets()
         if self._current_temp is None:
             # Nothing sensible to plan without a reading — fall back to low.
@@ -859,6 +876,18 @@ class PredictiveHeatingClimate(ClimateEntity):
         self._last_preheat_plan = plan
 
         new_target = plan.effective_target_temp
+        # Cap the pre-heat nudge at max_preheat_nudge above the scheduled
+        # high target. Without this, a very cold start could request a
+        # target many degrees above the scheduled Comfort temp, kicking
+        # the heat pump out of its efficient modulating range (see
+        # max_setpoint_delta comment). The low→high ramp in
+        # _effective_target never exceeds high_target today, so this is a
+        # safety net rather than a constant cap — but if we later add an
+        # anticipation term (as task notes imply), it'll enforce the
+        # user's chosen ceiling.
+        nudge_cap = getattr(self, "_max_preheat_nudge", 0.5)
+        if nudge_cap is not None and high > 0 and new_target > high + nudge_cap:
+            new_target = high + nudge_cap
         if abs(new_target - self._target_temp) > 0.01:
             self._target_temp = new_target
             self._controller.set_target_temp(new_target)
@@ -1251,10 +1280,53 @@ class PredictiveHeatingClimate(ClimateEntity):
             moment any room in the zone says "heat needed", every room
             in the zone visibly reflects "Heating" instead of staying
             stuck on "Idle" until the thermostat ACKs.
+
+        **Per-room gates on top of the zone state:**
+
+        * ``hvac_mode == OFF`` → always ``OFF``. The user turned this
+          room's climate entity off.
+        * ``window_open`` → always ``IDLE``. Even when a sibling has the
+          boiler firing, THIS room is venting; showing "Heating" would
+          be misleading (the radiator is off, or the user has manually
+          dropped the underlying thermostat to a safety setpoint).
+        * Underlying thermostat parked at a very low setpoint (≤ 6 °C)
+          *and* the room is currently above it → the user has manually
+          parked the room; treat it as idle regardless of zone demand.
+          6 °C catches the common 5 °C anti-freeze safety setpoint while
+          still allowing normal low-end comfort temps (8 °C sleep) to
+          pass through unaffected.
         """
         if self._hvac_mode == HVACMode.OFF:
             self._hvac_action = HVACAction.OFF
             return
+
+        # Window gate — venting rooms are never "heating" from the
+        # room's point of view, even if the zone as a whole is firing.
+        if self._window_open:
+            self._hvac_action = HVACAction.IDLE
+            return
+
+        # Manual safety-setpoint gate — user dropped the underlying
+        # thermostat to 5 °C (or similar anti-freeze level) to stop heat
+        # on this circuit. If the room temperature is already above that
+        # floor, there is no demand and nothing should show as heating.
+        try:
+            underlying = self.hass.states.get(self._climate_entity_id)
+            if underlying is not None:
+                underlying_target = underlying.attributes.get("temperature")
+                if underlying_target is not None:
+                    ut = float(underlying_target)
+                    if (
+                        ut <= 6.0
+                        and self._current_temp is not None
+                        and self._current_temp >= ut
+                    ):
+                        self._hvac_action = HVACAction.IDLE
+                        return
+        except (ValueError, TypeError):
+            # If we can't parse the underlying temperature, fall through
+            # to the default zone-based logic.
+            pass
 
         zone_active = self._zone.is_heating or self._zone.any_room_wants_heat
         if zone_active or self._wants_heat:
