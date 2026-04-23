@@ -19,8 +19,12 @@ from homeassistant.const import UnitOfPower, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_ROOM_NAME, DOMAIN, STATE_CALIBRATED
+from .const import CONF_ROOM_NAME, DOMAIN, STATE_CALIBRATED, UPDATE_INTERVAL
 from .thermal_model import ThermalModel
+
+# Normalisation factor: EKF innovations are in °C per UPDATE_INTERVAL tick.
+# Multiply by this to get a human-readable °C/h rate.
+_DT_TO_PER_HOUR = 3600.0 / UPDATE_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -124,12 +128,12 @@ class LearningProgressSensor(SensorEntity):
 
 
 class MeanPredictionErrorSensor(SensorEntity):
-    """Rolling average |observed-predicted| dT — the EKF's health check."""
+    """Rolling average |observed-predicted| dT, expressed as °C/h."""
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:chart-bell-curve"
-    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    # Displayed as a rate (°C/h) — no HA device_class maps to this.
+    _attr_native_unit_of_measurement = "°C/h"
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(
@@ -146,7 +150,8 @@ class MeanPredictionErrorSensor(SensorEntity):
         mpe = self._model.mean_prediction_error
         if mpe == float("inf"):
             return None
-        return round(mpe, 3)
+        # Convert from °C/tick to °C/h for human readability.
+        return round(mpe * _DT_TO_PER_HOUR, 3)
 
 
 class HeatingPowerSensor(SensorEntity):

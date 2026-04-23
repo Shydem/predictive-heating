@@ -302,9 +302,29 @@ class PredictiveHeatingClimate(ClimateEntity):
                 ),
             )
             # Restore last reading state from the model, if persisted.
+            # IMPORTANT: restore only the runtime state (meter readings,
+            # power, spike tracking) — NOT the config params. The config
+            # params (calorific_value, efficiency, heat_share) must always
+            # come from the current options so user changes take effect.
             saved = getattr(model, "_heat_source_state", None)
             if saved:
                 self._heat_source = GasHeatSource.from_dict(saved)
+                # Overwrite config fields with the current options values.
+                self._heat_source.calorific_value_mj_m3 = _to_float(
+                    options.get(CONF_GAS_CALORIFIC_VALUE)
+                    or config.get(CONF_GAS_CALORIFIC_VALUE),
+                    DEFAULT_GAS_CALORIFIC_VALUE,
+                )
+                self._heat_source.efficiency = _to_float(
+                    options.get(CONF_BOILER_EFFICIENCY)
+                    or config.get(CONF_BOILER_EFFICIENCY),
+                    DEFAULT_BOILER_EFFICIENCY,
+                )
+                self._heat_source.heat_share = _to_float(
+                    options.get(CONF_HEAT_SHARE)
+                    or config.get(CONF_HEAT_SHARE),
+                    DEFAULT_HEAT_SHARE,
+                )
             # Publish the heat source on the shared data dict so the
             # sensor platform (and any future platform) can read it
             # without a back-reference to this climate entity.
@@ -1083,6 +1103,27 @@ class PredictiveHeatingClimate(ClimateEntity):
             trace.append(current_temp)
         return trace
 
+    def _build_solar_trace(self, hours: int) -> list[float]:
+        """Return a per-hour solar irradiance trace for the next *hours* hours.
+
+        Uses the same sine-based model as ``_simulate_schedule``: a single
+        peak at solar noon, amplitude anchored to the current measured
+        irradiance (or 150 W/m² as a conservative default when unavailable).
+        """
+        import math as _math
+        solar_now = estimate_solar_irradiance(self.hass)
+        now_hour = time.gmtime().tm_hour
+        peak = max(solar_now, 200.0) if solar_now > 0 else 150.0
+        trace: list[float] = []
+        for h in range(hours):
+            hour = (now_hour + h) % 24
+            angle = _math.pi * (hour - 6) / 12
+            if angle <= 0 or angle >= _math.pi:
+                trace.append(0.0)
+            else:
+                trace.append(round(peak * _math.sin(angle), 1))
+        return trace
+
     async def _simulate_schedule(self) -> dict:
         """Produce a rich 24-hour trajectory under the current config.
 
@@ -1109,27 +1150,7 @@ class PredictiveHeatingClimate(ClimateEntity):
         while len(forecast) < 24:
             forecast.append(forecast[-1])
 
-        # Build a rough solar trace from sun position — the calculator
-        # returns current W/m², so we simulate 24 hourly samples by
-        # rotating the sun's elevation through the day. If numpy
-        # isn't available we just fall back to a simple shape.
-        solar_now = estimate_solar_irradiance(self.hass)
-        # Crude model: solar follows a sine bump peaking at local noon
-        # with amplitude ``solar_now`` if it's currently daytime, else
-        # reduced by 0.5. The point is only to *have* a solar shape —
-        # the exact numbers are a guide for the simulator, not ground
-        # truth.
-        import math
-        solar_trace: list[float] = []
-        now_hour = time.gmtime().tm_hour
-        peak = max(solar_now, 200.0) if solar_now > 0 else 150.0
-        for h in range(24):
-            hour = (now_hour + h) % 24
-            angle = math.pi * (hour - 6) / 12
-            if angle <= 0 or angle >= math.pi:
-                solar_trace.append(0.0)
-            else:
-                solar_trace.append(peak * math.sin(angle))
+        solar_trace = self._build_solar_trace(24)
 
         hysteresis = self._controller.hysteresis
         # Proportional band: open the "valve" as the room drops below
@@ -1409,6 +1430,7 @@ class PredictiveHeatingClimate(ClimateEntity):
                 solar_irradiance=solar,
                 horizon_hours=PREDICTION_HORIZON_HOURS,
                 setpoint_trace=setpoint_trace,
+                solar_trace=self._build_solar_trace(int(PREDICTION_HORIZON_HOURS)),
             )
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("Prediction snapshot failed: %s", err)

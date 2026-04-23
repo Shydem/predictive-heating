@@ -615,9 +615,11 @@ def _build_room_detail(
     schedule = _schedule_state(hass, config)
 
     mean_err = getattr(model, "mean_prediction_error", None)
-    # Guard: None or inf (not yet learned) → display as None
+    # Guard: None or inf (not yet learned) → display as None.
+    # Normalise from °C/tick (UPDATE_INTERVAL) to the more readable °C/h.
+    _dt_to_per_hour = 3600.0 / UPDATE_INTERVAL
     mean_err_out = (
-        round(mean_err, 3)
+        round(mean_err * _dt_to_per_hour, 3)
         if (mean_err is not None and mean_err != float("inf"))
         else None
     )
@@ -722,7 +724,9 @@ def _build_room_detail(
         "prediction_error_history": [
             {
                 "sample": e.get("sample"),
-                "value": _safe_float(e.get("value")),
+                # Normalise stored °C/tick value to °C/h for the chart.
+                "value": round(_safe_float(e.get("value")) * _dt_to_per_hour, 3)
+                if _safe_float(e.get("value")) is not None else None,
                 "ts": e.get("ts")
                 if e.get("ts") is not None
                 else now_ts - (len(getattr(model, "prediction_error_history", [])) - i - 1) * update_interval_s * 5,
@@ -756,15 +760,15 @@ def _build_room_detail(
         "last_simulation": last_simulation,
         "spike": spike_info,
         "override_on": override_on,
+        # Normalised to °C/h (÷ tick_hours) so the dashboard shows a
+        # human-readable rate of temperature change rather than a bare
+        # per-tick dT that varies with update cadence.
         "last_dT_observed": round(
-            float(getattr(model, "last_dT_observed", 0.0) or 0.0), 3
+            float(getattr(model, "last_dT_observed", 0.0) or 0.0) * _dt_to_per_hour, 2
         ),
         "last_dT_predicted": round(
-            float(getattr(model, "last_dT_predicted", 0.0) or 0.0), 3
+            float(getattr(model, "last_dT_predicted", 0.0) or 0.0) * _dt_to_per_hour, 2
         ),
-        # Time window (in seconds) over which the ΔT values are measured
-        # — exposed so the dashboard can show °C/min instead of a bare
-        # ΔT that's meaningless without knowing the tick length.
         "update_interval_s": int(UPDATE_INTERVAL),
         **zone_info,
     }

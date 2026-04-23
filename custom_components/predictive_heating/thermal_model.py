@@ -735,6 +735,7 @@ class ThermalModel:
         horizon_hours: float = PREDICTION_HORIZON_HOURS,
         setpoint_trace: list[float] | None = None,
         heating_fraction_trace: list[float] | None = None,
+        solar_trace: list[float] | None = None,
     ) -> None:
         """
         Store a forecast curve for later comparison with reality.
@@ -760,10 +761,11 @@ class ThermalModel:
         # model right?" check, not a science-grade forecast.
         hours = int(horizon_hours)
         outdoor_trace = [t_outdoor] * max(1, hours)
-        # Solar: naive fall-off — irradiance halves every 4 hours.
-        # Replaced at call time by the climate entity when a richer
-        # solar schedule is available.
-        solar_trace = [solar_irradiance * (0.5 ** (h / 4.0)) for h in range(hours)]
+        # Solar: use caller-supplied per-hour trace when available (e.g.
+        # the sine-based model from the climate entity). Fall back to a
+        # simple exponential decay only when nothing better is provided.
+        if solar_trace is None:
+            solar_trace = [solar_irradiance * (0.5 ** (h / 4.0)) for h in range(hours)]
 
         # If the caller provided a setpoint trace but no explicit
         # heating-fraction trace, build a proportional heat plan from
@@ -786,7 +788,7 @@ class ThermalModel:
             outdoor_trace=outdoor_trace,
             solar_trace=solar_trace,
             heating_fraction_trace=heating_fraction_trace,
-            step_minutes=15.0,
+            step_minutes=5.0,
         )
         # Annotate each step with the active setpoint so the dashboard
         # can draw the scheduled target alongside the predicted temp.
