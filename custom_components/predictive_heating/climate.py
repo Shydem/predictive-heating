@@ -877,10 +877,12 @@ class PredictiveHeatingClimate(ClimateEntity):
         effectively neutralising the override. The controller + HVAC action
         are not disturbed here; they'll be refreshed via the periodic tick.
         """
-        if self._override_on:
+        if self._override_on or self._manual_temp_override:
             # Leave target / controller alone — override owns the setpoint
-            # until the switch is released. Still clear the cached plan so
-            # the dashboard reflects "no pre-heat while overridden".
+            # until the switch is released (override_on) or until the next
+            # schedule slot transition (manual_temp_override). Still clear
+            # the cached plan so the dashboard reflects "no pre-heat while
+            # overridden".
             self._last_preheat_plan = None
             return
 
