@@ -381,6 +381,11 @@ class PredictiveHeatingClimate(ClimateEntity):
         # when the schedule slot does not advertise a preset (we fall
         # back to the on/off presets in that case).
         self._schedule_active_preset: str | None = None
+        # True when the user manually called set_temperature (preset = NONE).
+        # The schedule will NOT overwrite the target while this flag is set.
+        # It is automatically cleared on the next schedule slot transition
+        # (on → off or off → on), so the override expires naturally.
+        self._manual_temp_override: bool = False
 
         # Override + occupancy entities
         self._override_entity_id: str | None = (
@@ -715,10 +720,15 @@ class PredictiveHeatingClimate(ClimateEntity):
             self._schedule_active_state = None
             self._schedule_override_temp = None
             self._schedule_active_preset = None
+            self._manual_temp_override = False
             self._apply_preheat_plan()
             return
 
         s = state.state
+        # Slot transition (on ↔ off): clear any manual temperature override
+        # so the new slot's preset is applied cleanly.
+        if s != self._schedule_active_state and self._schedule_active_state is not None:
+            self._manual_temp_override = False
         self._schedule_active_state = s
 
         # If the schedule still exposes a numeric temperature attribute
@@ -781,7 +791,7 @@ class PredictiveHeatingClimate(ClimateEntity):
             preset_enum.value if preset_enum is not None else None
         )
 
-        if preset_enum is not None and not self._override_on:
+        if preset_enum is not None and not self._override_on and not self._manual_temp_override:
             if self._preset_mode != preset_enum:
                 self._preset_mode = preset_enum
                 self._controller.set_preset(preset_enum)
@@ -1787,6 +1797,10 @@ class PredictiveHeatingClimate(ClimateEntity):
             self._target_temp = temp
             self._controller.set_target_temp(temp)
             self._preset_mode = PresetMode.NONE
+            # Mark as a manual override so the schedule does not
+            # immediately overwrite this temperature on the next tick.
+            # The flag is cleared on the next schedule slot transition.
+            self._manual_temp_override = True
             self._run_control_loop()
             self.async_write_ha_state()
 
@@ -1798,6 +1812,8 @@ class PredictiveHeatingClimate(ClimateEntity):
             _LOGGER.warning("Unknown preset mode: %s", preset_mode)
             return
 
+        # Explicitly choosing a preset re-engages the schedule.
+        self._manual_temp_override = False
         self._preset_mode = preset
         self._controller.set_preset(preset)
         self._target_temp = self._controller.state.target_temp
