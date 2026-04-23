@@ -199,6 +199,26 @@ class GasHeatSource:
             )
             delta_m3 = 0.0
 
+        # Sanity cap: a 50 kW boiler at full tilt consumes at most ~6 m³/h
+        # (≈ 0.0017 m³/s). Anything beyond 10× that rate almost certainly
+        # means the stored baseline came from a different sensor (e.g. after
+        # the user corrected the entity ID) or a unit mismatch (L vs m³).
+        # In that case, discard the derivative and let the next tick form a
+        # clean baseline rather than feeding a ~MW figure to the EKF.
+        max_plausible_m3 = dt * (60.0 / 3600.0)  # 60 m³/h absolute ceiling
+        if delta_m3 > max_plausible_m3:
+            _LOGGER.warning(
+                "Gas meter delta %.3f m³ in %.0f s is physically implausible "
+                "(max %.3f m³) — baseline was likely from a different sensor. "
+                "Resetting baseline; spike counter cleared.",
+                delta_m3, dt, max_plausible_m3,
+            )
+            # Reset spike state too — the bogus reading may have triggered it.
+            self._in_spike = False
+            self._spike_samples.clear()
+            self._last_power_w = 0.0
+            return None
+
         energy_mj = delta_m3 * self.calorific_value_mj_m3 * self.efficiency
         gross_power_w = energy_mj * 1.0e6 / dt
         heat_power_w = gross_power_w * self.heat_share
